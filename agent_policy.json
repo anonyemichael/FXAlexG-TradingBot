@@ -1,0 +1,33 @@
+{
+  "generation": 2,
+  "name": "Adaptive Risk & Pattern Focus",
+  "min_confidence": 80,
+  "sl_min_forex_pips": 15.0,
+  "sl_min_crypto_pct": 1.2,
+  "allowed_triggers": [
+    "15m_choch"
+  ],
+  "restricted_triggers": {
+    "4h_engulfing": "Requires confirmed 15M CHoCH displacement and subsequent retest before execution."
+  },
+  "asset_rules": {
+    "XAUUSDm": {
+      "min_balance_required": 100.0,
+      "status": "LOCKED_MICRO_BALANCE"
+    },
+    "Crypto": {
+      "status": "PRIORITY_ACTIVE"
+    },
+    "Forex": {
+      "status": "ACTIVE_WITH_WIDE_STOPS"
+    }
+  },
+  "axioms": [
+    "Never trade assets where minimum lot size risk exceeds 1% of account balance, regardless of pattern confidence.",
+    "Discontinue trading patterns with zero win rate until a robust, data-backed confirming signal is integrated into the entry logic.",
+    "Ensure stop-loss placement accounts for market noise, using a minimum of 1.5x average true range or specified pip/percentage minimums to prevent premature exits.",
+    "Prioritize execution on asset classes and patterns demonstrating positive expectancy and a proven win rate above 20%."
+  ],
+  "evolution_summary": "This generation significantly tightens risk management by restricting high-loss patterns and assets, while widening stop-losses to reduce noise-induced exits. It prioritizes the only profitable asset class and trigger pattern, aiming for higher quality trades and improved expectancy.",
+  "last_trained": "2026-10-31T08:42:51.202642+00:00"
+}
