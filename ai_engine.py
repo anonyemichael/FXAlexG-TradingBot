@@ -169,7 +169,7 @@ def get_market_context_str(bot_status: dict = None) -> str:
 
 # ── Core AI Calling Functions (100% Google Gemini) ──────────────────
 
-def call_gemini(prompt: str = "", system_instruction: str = "", history: list[dict] = None) -> str:
+def call_gemini(prompt: str = "", system_instruction: str = "", history: list[dict] = None, json_mode: bool = False) -> str:
     """
     Calls Google Gemini API using an active multi-key pool with automatic failover across keys and models.
     Cycles through all configured API keys if one encounters rate limits (429) or service issues (503).
@@ -210,9 +210,14 @@ def call_gemini(prompt: str = "", system_instruction: str = "", history: list[di
         "contents": contents,
         "generationConfig": {
             "temperature": 0.2,
-            "maxOutputTokens": 2048,
+            "maxOutputTokens": 4096,
         }
     }
+    if json_mode:
+        # Gemini 2.5 "thinking" tokens count against maxOutputTokens and were truncating the
+        # JSON mid-string ("Unterminated string"), which the gatekeeper treated as a rejection.
+        payload["generationConfig"]["responseMimeType"] = "application/json"
+        payload["generationConfig"]["thinkingConfig"] = {"thinkingBudget": 0}
     if system_instruction:
         payload["systemInstruction"] = {
             "parts": [{"text": system_instruction}]
@@ -244,10 +249,10 @@ def call_gemini(prompt: str = "", system_instruction: str = "", history: list[di
     raise RuntimeError(f"All {len(keys)} Gemini keys exhausted. Errors: {'; '.join(errors[-3:])}")
 
 
-def query_ai(prompt: str = "", system_instruction: str = "", history: list[dict] = None) -> tuple[str, str]:
+def query_ai(prompt: str = "", system_instruction: str = "", history: list[dict] = None, json_mode: bool = False) -> tuple[str, str]:
     """Direct Gemini AI query. Returns (response_text, provider_name)."""
     try:
-        res = call_gemini(prompt, system_instruction, history=history)
+        res = call_gemini(prompt, system_instruction, history=history, json_mode=json_mode)
         return res, "Google Gemini 2.5 Flash"
     except Exception as e:
         logger.error(f"Gemini call failed: {e}")
@@ -364,7 +369,7 @@ Analyze this setup and output ONLY a valid JSON object with these exact keys:
 Do NOT wrap in markdown code fences. Return raw JSON only."""
 
     try:
-        raw, provider = query_ai(prompt, SYSTEM_QUANT_PROMPT)
+        raw, provider = query_ai(prompt, SYSTEM_QUANT_PROMPT, json_mode=True)
         clean = re.sub(r"^```json\s*", "", raw.strip(), flags=re.MULTILINE)
         clean = re.sub(r"```$", "", clean.strip(), flags=re.MULTILINE)
         result = json.loads(clean)
@@ -471,7 +476,7 @@ Output ONLY valid JSON with these exact keys:
 Do NOT wrap in markdown fences. Raw JSON only."""
 
     try:
-        raw, provider = query_ai(prompt, SYSTEM_QUANT_PROMPT)
+        raw, provider = query_ai(prompt, SYSTEM_QUANT_PROMPT, json_mode=True)
         clean = re.sub(r"^```json\s*", "", raw.strip(), flags=re.MULTILINE)
         clean = re.sub(r"```$", "", clean.strip(), flags=re.MULTILINE)
         data = json.loads(clean)

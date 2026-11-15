@@ -38,11 +38,12 @@ def init_db():
             trigger TEXT
         )
     """)
-    # Ensure trigger column exists for existing databases
-    try:
-        c.execute("ALTER TABLE trades ADD COLUMN trigger TEXT")
-    except Exception:
-        pass
+    # Ensure newer columns exist for existing databases
+    for col in ("trigger TEXT", "login INTEGER"):
+        try:
+            c.execute(f"ALTER TABLE trades ADD COLUMN {col}")
+        except Exception:
+            pass
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS scans (
@@ -74,17 +75,17 @@ def init_db():
     conn.close()
 
 
-def log_trade_opened(setup, lot, risk_usd, ticket):
+def log_trade_opened(setup, lot, risk_usd, ticket, login=None):
     conn = _conn()
     c = conn.cursor()
     now = datetime.now(timezone.utc).isoformat()
     c.execute("""
-        INSERT INTO trades (opened_at, symbol, direction, grade, score, lot, entry, sl, tp, rr, risk_usd, ticket, status, tp1, tp2, trigger)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)
+        INSERT INTO trades (opened_at, symbol, direction, grade, score, lot, entry, sl, tp, rr, risk_usd, ticket, status, tp1, tp2, trigger, login)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
     """, (
         now, setup["symbol"], setup["direction"], setup["grade"], setup["score"],
         lot, setup["entry"], setup["sl"], setup["tp"], setup["rr"], risk_usd, ticket,
-        setup.get("tp1"), setup.get("tp2"), setup.get("trigger", ""),
+        setup.get("tp1"), setup.get("tp2"), setup.get("trigger", ""), int(login) if login else None,
     ))
     conn.commit()
     conn.close()
@@ -128,10 +129,16 @@ def log_scan(symbol, grade, score, direction, action):
     conn.close()
 
 
-def get_open_trade_tickets():
+def get_open_trade_tickets(login=None, is_master=True):
+    """Open tickets for one MT5 account. Trades logged before the login column existed
+    (login IS NULL) belong to the master account, so they are included only for the master."""
     conn = _conn()
     c = conn.cursor()
-    c.execute("SELECT ticket FROM trades WHERE status = 'open'")
+    if login is None:
+        c.execute("SELECT ticket FROM trades WHERE status = 'open'")
+    else:
+        c.execute("SELECT ticket FROM trades WHERE status = 'open' AND (login = ? OR (login IS NULL AND ? = 1))",
+                  (int(login), 1 if is_master else 0))
     tickets = [r[0] for r in c.fetchall()]
     conn.close()
     return tickets
@@ -147,23 +154,39 @@ def get_trade_by_ticket(ticket):
     return dict(row) if row else None
 
 
-def get_daily_trade_count():
+def get_daily_trade_count(login=None):
     conn = _conn()
     c = conn.cursor()
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    c.execute("SELECT COUNT(*) FROM trades WHERE opened_at LIKE ?", (f"{today}%",))
+    if login is None:
+        c.execute("SELECT COUNT(*) FROM trades WHERE opened_at LIKE ?", (f"{today}%",))
+    else:
+        c.execute("SELECT COUNT(*) FROM trades WHERE opened_at LIKE ? AND login = ?", (f"{today}%", int(login)))
     count = c.fetchone()[0]
     conn.close()
     return count
 
 
-def get_kill_zone_trade_count(kill_zone):
-    """Returns number of trades opened in the current kill zone session today."""
+_KZ_HOURS = {"asian": (0, 4), "london": (7, 10), "new_york": (12, 15)}
+
+
+def get_kill_zone_trade_count(kill_zone, login=None):
+    """Returns number of trades opened inside this kill zone's hours today (optionally for one account)."""
+    start_h, end_h = _KZ_HOURS.get(kill_zone, (0, 24))
     conn = _conn()
     c = conn.cursor()
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    c.execute("SELECT COUNT(*) FROM trades WHERE opened_at LIKE ?", (f"{today}%",))
-    count = c.fetchone()[0]
+    if login is None:
+        c.execute("SELECT opened_at FROM trades WHERE opened_at LIKE ?", (f"{today}%",))
+    else:
+        c.execute("SELECT opened_at FROM trades WHERE opened_at LIKE ? AND login = ?", (f"{today}%", int(login)))
+    count = 0
+    for (opened_at,) in c.fetchall():
+        try:
+            if start_h <= datetime.fromisoformat(opened_at).hour < end_h:
+                count += 1
+        except Exception:
+            pass
     conn.close()
     return count
 
@@ -276,6 +299,30 @@ def get_relevant_memories(symbol: str, trigger_type: str = None, limit: int = 3)
 
     conn.close()
     return memories
+
+
+def stats_by_login(since_iso=None):
+    """{login: {"closed", "wins", "losses", "net", "open", "best", "worst"}} for the scoreboard."""
+    conn = _conn()
+    c = conn.cursor()
+    q = "SELECT login, status, result_usd FROM trades WHERE login IS NOT NULL"
+    args = ()
+    if since_iso:
+        q += " AND opened_at >= ?"
+        args = (since_iso,)
+    out = {}
+    for login, status, res in c.execute(q, args):
+        s = out.setdefault(int(login), {"closed": 0, "wins": 0, "losses": 0, "net": 0.0, "open": 0, "best": 0.0, "worst": 0.0})
+        if status == "open":
+            s["open"] += 1
+        elif res is not None:
+            s["closed"] += 1
+            s["net"] += res
+            s["wins" if res > 0 else "losses"] += 1
+            s["best"] = max(s["best"], res)
+            s["worst"] = min(s["worst"], res)
+    conn.close()
+    return out
 
 
 def get_recent_trades(limit=5):

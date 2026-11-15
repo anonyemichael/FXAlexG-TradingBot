@@ -59,6 +59,11 @@ def init_db():
             last_checked TEXT
         )
     """)
+    # Per-account method: "trend" (crypto trend), "smc" (original SMC, mechanical), "smc_ai" (SMC + AI veto)
+    try:
+        c.execute("ALTER TABLE accounts ADD COLUMN strategy TEXT DEFAULT 'trend'")
+    except Exception:
+        pass
     conn.commit()
 
     # Pre-populate master demo and real accounts from config if table is empty
@@ -209,6 +214,21 @@ def set_account_risk(login: int, risk_pct: float) -> bool:
     conn = _conn()
     c = conn.cursor()
     c.execute("UPDATE accounts SET risk_pct = ? WHERE login = ?", (float(risk_pct), int(login)))
+    changed = c.rowcount > 0
+    conn.commit()
+    conn.close()
+    return changed
+
+
+STRATEGIES = ("trend", "trend_fast", "smc", "smc_ai")
+
+
+def set_account_strategy(login: int, strategy: str) -> bool:
+    if strategy not in STRATEGIES:
+        return False
+    conn = _conn()
+    c = conn.cursor()
+    c.execute("UPDATE accounts SET strategy = ? WHERE login = ?", (strategy, int(login)))
     changed = c.rowcount > 0
     conn.commit()
     conn.close()

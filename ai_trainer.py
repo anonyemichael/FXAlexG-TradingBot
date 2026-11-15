@@ -200,7 +200,7 @@ Output ONLY a valid JSON object representing the evolved Agent Policy for Genera
 Return raw JSON only."""
 
     try:
-        raw, provider = ai_engine.query_ai(prompt, "You are a quantitative hedge fund architect specializing in algorithmic trade policy optimization.")
+        raw, provider = ai_engine.query_ai(prompt, "You are a quantitative hedge fund architect specializing in algorithmic trade policy optimization.", json_mode=True)
         clean = re.sub(r"^```json\s*", "", raw.strip(), flags=re.MULTILINE)
         clean = re.sub(r"```$", "", clean.strip(), flags=re.MULTILINE)
         evolved_policy = json.loads(clean)

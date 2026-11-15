@@ -26,6 +26,7 @@ import news_filter
 import notifier
 import ai_engine
 import account_manager
+import trend_strategy
 
 ACCOUNT_WIZARDS = {}  # {chat_id: {"step": "...", "server": "...", "login": 123, ...}}
 
@@ -93,16 +94,56 @@ def current_kill_zone():
     return None
 
 
-def check_closed_positions():
-    """Polls database for open trades and reconciles with MT5 positions."""
-    open_tickets = trade_logger.get_open_trade_tickets()
+_close_lookup_misses = {}   # {ticket: consecutive polls where the deal history was unavailable}
+_action_failures = {}       # {(ticket, action): failed attempts} — stops TTL/TP1 retry loops
+_news_alerted = set()       # {(symbol, title)} — one Telegram alert per news event
+
+
+def _master_login():
+    prof = config.ACCOUNTS.get(load_active_account(), {})
+    return int(prof.get("login") or 0) or None
+
+
+def _tag(login=None):
+    """'🎯 SMC (yours) · #477674441' — which bot a Telegram message is about."""
+    login = login or _master_login()
+    acc = account_manager.get_account(login) if login else None
+    return notifier.bot_tag(acc or {"login": login})
+
+
+def _restore_master():
+    prof = config.ACCOUNTS.get(load_active_account(), {})
+    if prof.get("login"):
+        bridge.switch_account(prof.get("login"), prof.get("password"), prof.get("server"))
+
+
+def check_closed_positions(login=None, is_master=True):
+    """Polls database for open trades of the account the bridge is logged into and reconciles
+    them with its MT5 positions."""
+    if login is None:
+        login = _master_login()
+    open_tickets = trade_logger.get_open_trade_tickets(login, is_master)
     if not open_tickets:
         return
     live_positions = bridge.get_positions()
-    live_tickets = {p["ticket"] for p in live_positions} if live_positions else set()
+    if live_positions is None:
+        return  # bridge unreachable — we don't know what's open, so don't close anything
+    live_tickets = {p["ticket"] for p in live_positions}
     for ticket in open_tickets:
         if ticket not in live_tickets:
             profit = bridge.get_position_result(ticket)
+            if profit is None:
+                # History not available yet (or bridge hiccup). Retry for ~10 min before giving up,
+                # instead of immediately recording a fake $0.00 result.
+                misses = _close_lookup_misses.get(ticket, 0) + 1
+                _close_lookup_misses[ticket] = misses
+                if misses >= 40:
+                    trade_logger.log_trade_closed(ticket, None)
+                    _close_lookup_misses.pop(ticket, None)
+                    notifier.send(f"<b>{_tag(login)}</b>\n⚠️ Trade #{ticket} is no longer open but its P&L could not be read from MT5. Check the terminal history.")
+                    print(f"[{_ts()}] Trade #{ticket} closed — P&L unknown.")
+                continue
+            _close_lookup_misses.pop(ticket, None)
             if profit is not None:
                 trade_logger.log_trade_closed(ticket, profit)
                 pnl_str = str(round(profit, 2))
@@ -117,23 +158,23 @@ def check_closed_positions():
                             ai_note = f"\n\n🧠 <b>AI Trade Review:</b>\n<i>{ai_rev}</i>"
                     except Exception as e:
                         print(f"[{_ts()}] AI post-mortem error: {e}")
-                notifier.send(f"🏁 Trade #{ticket} closed — P&L: <b>${sign}{pnl_str}</b>{ai_note}")
+                res_emoji = "✅ WIN" if profit > 0 else ("⚪ BREAKEVEN" if profit == 0 else "❌ LOSS")
+                notifier.send(f"<b>{_tag(trade_rec.get('login') or login)}</b>\n🏁 <b>CLOSED {trade_rec.get('symbol', '')}</b> — {res_emoji} <b>${sign}{pnl_str}</b>\nTicket #{ticket}{ai_note}")
                 print(f"[{_ts()}] Trade #{ticket} closed with P&L: ${sign}{pnl_str}")
-                # Autonomous Meta-Learning: Trigger agent policy evolution on trade outcome
-                try:
-                    import ai_trainer
-                    print(f"[{_ts()}] 🧬 Triggering autonomous agent self-training cycle...")
-                    ai_trainer.train_agent(notify=True)
-                except Exception as te:
-                    print(f"[{_ts()}] Auto-training failed: {te}")
-            else:
-                trade_logger.log_trade_closed(ticket, 0.0)
-                print(f"[{_ts()}] Trade #{ticket} closed — logged.")
+                # Policy evolution rewrites trading rules from a handful of trades, which is noise.
+                # Off by default; can still be run on demand from Telegram (🧬 Agent Evolution).
+                if getattr(config, "AI_AUTO_TRAIN", False):
+                    try:
+                        import ai_trainer
+                        print(f"[{_ts()}] 🧬 Triggering autonomous agent self-training cycle...")
+                        ai_trainer.train_agent(notify=True)
+                    except Exception as te:
+                        print(f"[{_ts()}] Auto-training failed: {te}")
 
 
-def manage_open_positions():
+def manage_open_positions(login=None, is_master=True):
     """Manages TP1 partial profit, moves SL to breakeven, trails stop, and enforces TTL."""
-    open_tickets = trade_logger.get_open_trade_tickets()
+    open_tickets = trade_logger.get_open_trade_tickets(login or _master_login(), is_master)
     if not open_tickets:
         return
     live_positions = bridge.get_positions()
@@ -152,6 +193,9 @@ def manage_open_positions():
         if not pos:
             continue
 
+        if trade.get("trigger") in trend_strategy.TRIGGERS:
+            continue  # trend trades are managed once per day by manage_trend_positions()
+
         entry     = trade["entry"]
         tp1       = trade.get("tp1")
         tp2       = trade.get("tp2")
@@ -159,16 +203,25 @@ def manage_open_positions():
         symbol    = trade["symbol"]
         opened_at_str = trade.get("opened_at")
 
-        # 1. Trade TTL Check (Max lifespan)
-        if opened_at_str and hasattr(config, "MAX_TRADE_LIFESPAN_HOURS"):
+        # 1. Trade TTL Check (Max lifespan). 0 / None disables it.
+        ttl_h = getattr(config, "MAX_TRADE_LIFESPAN_HOURS", 0)
+        is_crypto = any(c in symbol.upper() for c in ("BTC", "ETH", "SOL", "XRP", "LTC"))
+        if opened_at_str and ttl_h and (is_crypto or is_forex_market_open()):
             try:
                 opened_at = datetime.fromisoformat(opened_at_str).replace(tzinfo=timezone.utc)
                 hours_open = (now - opened_at).total_seconds() / 3600.0
-                if hours_open > config.MAX_TRADE_LIFESPAN_HOURS and not trade_logger.is_partial_closed(ticket):
+                if hours_open > ttl_h and not trade_logger.is_partial_closed(ticket) \
+                        and _action_failures.get((ticket, "ttl"), 0) < 5:
                     print(f"[{_ts()}] TTL Exceeded ({hours_open:.1f}h) for {symbol} #{ticket}. Closing.")
                     res = bridge.close_position(ticket)
                     if res and "error" not in res:
-                        notifier.send(f"🕒 Closed {symbol} #{ticket} — Lifespan exceeded ({config.MAX_TRADE_LIFESPAN_HOURS}h).")
+                        notifier.send(f"<b>{_tag(trade.get('login'))}</b>\n🕒 Closed {symbol} #{ticket} — lifespan exceeded ({ttl_h}h).")
+                    else:
+                        n = _action_failures[(ticket, "ttl")] = _action_failures.get((ticket, "ttl"), 0) + 1
+                        err = res.get("error", "no response") if res else "no response"
+                        print(f"[{_ts()}] TTL close failed for #{ticket} (attempt {n}/5): {err}")
+                        if n == 5:
+                            notifier.send(f"<b>{_tag(trade.get('login'))}</b>\n⚠️ Could not close {symbol} #{ticket} after lifespan expiry: {err}. Leaving it on its hard SL/TP.")
                     continue
             except Exception as e:
                 print(f"[{_ts()}] TTL error: {e}")
@@ -184,20 +237,33 @@ def manage_open_positions():
             tp1_hit = (direction == "bullish" and current_price >= tp1) or \
                       (direction == "bearish" and current_price <= tp1)
 
-            if tp1_hit:
+            if tp1_hit and _action_failures.get((ticket, "tp1"), 0) < 3:
                 try:
                     full_volume = pos["volume"]
-                    partial_volume = round(full_volume * config.PARTIAL_PCT, 2)
-                    partial_volume = max(0.01, partial_volume)
+                    sinfo = bridge.get_symbol_info(symbol) or {}
+                    vol_min = float(sinfo.get("volume_min", 0.01) or 0.01)
+                    vol_step = float(sinfo.get("volume_step", 0.01) or 0.01)
+                    partial_volume = round(int(full_volume * config.PARTIAL_PCT / vol_step) * vol_step, 2)
 
-                    print(f"[{_ts()}] TP1 HIT: {symbol} #{ticket} — closing {partial_volume} of {full_volume}")
-                    close_result = bridge.partial_close(ticket, partial_volume)
-                    if not close_result or "error" in close_result:
-                        err = close_result.get("error", "unknown") if close_result else "no response"
-                        notifier.send(f"⚠️ TP1 partial close failed for {symbol} #{ticket}: {err}")
-                        continue
-
-                    partial_profit = close_result.get("profit", 0)
+                    # If the position is too small to split (e.g. 0.01 lot, or ETH's 0.1 minimum),
+                    # do NOT close it all at TP1 — just protect it at breakeven and let it run to TP2.
+                    can_split = partial_volume >= vol_min and (full_volume - partial_volume) >= vol_min - 1e-9
+                    partial_profit = 0.0
+                    if can_split and config.PARTIAL_PCT > 0:
+                        print(f"[{_ts()}] TP1 HIT: {symbol} #{ticket} — closing {partial_volume} of {full_volume}")
+                        close_result = bridge.partial_close(ticket, partial_volume)
+                        if not close_result or "error" in close_result:
+                            err = close_result.get("error", "unknown") if close_result else "no response"
+                            n = _action_failures[(ticket, "tp1")] = _action_failures.get((ticket, "tp1"), 0) + 1
+                            print(f"[{_ts()}] TP1 partial close failed for #{ticket} (attempt {n}/3): {err}")
+                            if n == 3:
+                                notifier.send(f"<b>{_tag(trade.get('login'))}</b>\n⚠️ TP1 partial close failed 3x for {symbol} #{ticket}: {err}")
+                            continue
+                        # bridge reports the whole position's floating P&L; scale to the closed part
+                        partial_profit = close_result.get("profit", 0) * (partial_volume / full_volume)
+                    else:
+                        print(f"[{_ts()}] TP1 HIT: {symbol} #{ticket} — {full_volume} lot too small to split, moving SL to breakeven only")
+                        partial_volume = 0.0
 
                     # Spread-aware breakeven buffer
                     if "BTC" in symbol:   be_buffer = 15.0
@@ -215,12 +281,18 @@ def manage_open_positions():
                         print(f"[{_ts()}] Breakeven SL modify: {modify_result}")
 
                     trade_logger.log_partial_close(ticket, partial_profit)
-                    pnl_str = str(round(partial_profit, 2))
-                    msg = (
-                        f"🎯 <b>TP1 HIT — {symbol} #{ticket}</b>\n\n"
-                        f"Secured {partial_volume} lot @ 1:{config.TP1_RR} | P&L: <b>+${pnl_str}</b>\n"
-                        f"Remaining {round(full_volume - partial_volume, 2)} lot -> SL moved to Breakeven (+buffer)"
-                    )
+                    if partial_volume:
+                        msg = (
+                            f"<b>{_tag(trade.get('login'))}</b>\n🎯 <b>TP1 HIT — {symbol} #{ticket}</b>\n\n"
+                            f"Secured {partial_volume} lot @ 1:{config.TP1_RR} | P&L: <b>+${partial_profit:.2f}</b>\n"
+                            f"Remaining {round(full_volume - partial_volume, 2)} lot -> SL moved to Breakeven (+buffer)"
+                        )
+                    else:
+                        msg = (
+                            f"<b>{_tag(trade.get('login'))}</b>\n🎯 <b>TP1 HIT — {symbol} #{ticket}</b>\n\n"
+                            f"Position ({full_volume} lot) is at minimum size, so nothing was closed.\n"
+                            f"SL moved to Breakeven (+buffer); running to TP2."
+                        )
                     notifier.send(msg)
                     print(f"[{_ts()}] {msg}")
                 except Exception as e:
@@ -254,24 +326,63 @@ def check_ema_invalidation():
     pass
 
 
-def _dispatch_setup_to_accounts(setup, side, grade, score, has_news=False):
+def _revalidate_at_market(setup):
+    """Re-checks SL distance and R:R against the live price right before sending the order.
+    Returns False if price already ran too far toward TP (or through SL)."""
+    live = bridge.get_price(setup["symbol"])
+    if live is None:
+        return True  # can't check; keep the candle-based plan
+    if setup.get("trigger") in trend_strategy.TRIGGERS:
+        # Trend trades have no TP; the stop is a fixed ATR distance from the actual fill.
+        setup["entry"] = live
+        setup["sl"] = round(live - setup["sl_dist"], 6)
+        return True
+    buy = setup["direction"] == "bullish"
+    risk = (live - setup["sl"]) if buy else (setup["sl"] - live)
+    reward = (setup["tp2"] - live) if buy else (live - setup["tp2"])
+    if risk <= 0 or reward <= 0:
+        print(f"[{_ts()}] {setup['symbol']}: live price {live} already beyond SL/TP. Skipping.")
+        return False
+    rr = reward / risk
+    if rr < config.MIN_RR:
+        print(f"[{_ts()}] {setup['symbol']}: R:R at live price {live} is 1:{rr:.2f} (< {config.MIN_RR}). Skipping.")
+        return False
+    # size on the larger of planned / live distance so real risk never exceeds the target
+    setup["sl_dist"] = max(setup["sl_dist"], risk)
+    setup["rr"] = round(rr, 2)
+    return True
+
+
+def _dispatch_setup_to_accounts(setup, side, grade, score, has_news=False, methods=("trend",), kill_zone=None):
     """
-    Executes an A+ signal across all active registered accounts in accounts.db.
+    Executes a signal on every active account whose assigned strategy is in `methods`.
     Calculates dynamic proportional lot size per account based on individual equity and risk %.
     """
     symbol = setup["symbol"]
-    active_accounts = account_manager.get_active_accounts()
-    
+    if not _revalidate_at_market(setup):
+        return
+    active_accounts = [a for a in account_manager.get_active_accounts()
+                       if (a.get("strategy") or "trend") in methods]
+    if not active_accounts and account_manager.get_active_accounts():
+        return  # accounts exist, just none assigned to this method
+
     if not active_accounts:
         acc = bridge.get_account()
         bal = acc.get("balance", 0.0) if acc else 0.0
         lot, risk_usd, risk_pct, warn = risk_manager.calculate_lot_size(symbol, setup["sl_dist"], bal)
-        if lot and lot > 0:
-            order_res = bridge.place_order(symbol=symbol, side=side, lot=lot, sl=setup["sl"], tp=setup["tp2"], comment=f"FXAlexG {grade}")
-            if order_res and "error" not in order_res:
-                t = order_res.get("ticket")
-                trade_logger.log_trade_opened(setup, lot, risk_usd, t)
-                notifier.send_trade_opened(setup, lot, risk_usd, risk_pct)
+        if not lot or lot <= 0:
+            print(f"[{_ts()}] {symbol}: setup skipped by risk manager: {warn}")
+            notifier.send(f"🚫 <b>{symbol} setup skipped</b> — {warn}")
+            return
+        order_res = bridge.place_order(symbol=symbol, side=side, lot=lot, sl=setup["sl"], tp=setup["tp2"], comment=f"FXAlexG {grade}")
+        if order_res and "error" not in order_res:
+            t = order_res.get("ticket")
+            trade_logger.log_trade_opened(setup, lot, risk_usd, t, login=(acc or {}).get("login"))
+            notifier.send_trade_opened(setup, lot, risk_usd, risk_pct)
+        else:
+            err = order_res.get("error", "no response") if order_res else "no response"
+            print(f"[{_ts()}] {symbol}: order rejected by broker: {err}")
+            notifier.send(f"❌ <b>{symbol} order rejected</b> — {err}")
         return
 
     curr_active = load_active_account()
@@ -301,12 +412,34 @@ def _dispatch_setup_to_accounts(setup, side, grade, score, has_news=False):
             cur = acc_info.get("currency", "USD")
             account_manager.update_account_balance(login, bal, eq, cur)
 
+            # Per-account limits (each account is its own experiment)
+            acc_pos = bridge.get_positions()
+            if acc_pos is None:
+                print(f"[{_ts()}] Multi-Account: #{login} positions unreadable — skipped.")
+                continue
+            if any(p["symbol"] == symbol for p in acc_pos):
+                print(f"[{_ts()}] Multi-Account: #{login} already holds {symbol} — skipped.")
+                continue
+            is_trend = setup.get("trigger") in trend_strategy.TRIGGERS
+            max_open = getattr(config, "TREND_MAX_OPEN", 4) if is_trend else config.MAX_CONCURRENT
+            if len(acc_pos) >= max_open:
+                print(f"[{_ts()}] Multi-Account: #{login} has {len(acc_pos)} open (max {max_open}) — skipped.")
+                continue
+            if not is_trend:
+                if trade_logger.get_daily_trade_count(login) >= config.MAX_TRADES_DAY:
+                    print(f"[{_ts()}] Multi-Account: #{login} daily trade limit reached — skipped.")
+                    continue
+                if kill_zone and trade_logger.get_kill_zone_trade_count(kill_zone, login) >= config.MAX_TRADES_KILL_ZONE:
+                    print(f"[{_ts()}] Multi-Account: #{login} {kill_zone} kill-zone limit reached — skipped.")
+                    continue
+
             # 2. Dynamic lot sizing strictly adhering to this account's equity and risk %
             lot, risk_usd, actual_pct, warn = risk_manager.calculate_lot_size(
                 symbol, setup["sl_dist"], bal, risk_pct=r_pct
             )
             if not lot or lot <= 0:
                 print(f"[{_ts()}] Multi-Account: #{login} (${bal:.2f}) skipped: {warn}")
+                notifier.send(f"<b>{notifier.bot_tag(acc)}</b>\n🚫 <b>{symbol} skipped</b> — {warn}", chat_id=acc.get("chat_id") or None)
                 continue
 
             # 3. Send market order with hard MT5 broker-side SL/TP
@@ -322,12 +455,13 @@ def _dispatch_setup_to_accounts(setup, side, grade, score, has_news=False):
             if order_res and "error" not in order_res:
                 ticket = order_res.get("ticket")
                 total_executed += 1
-                trade_logger.log_trade_opened(setup, lot, risk_usd, ticket)
-                notifier.send_trade_opened_for_account(acc, setup, lot, risk_usd, ticket)
+                trade_logger.log_trade_opened(setup, lot, risk_usd, ticket, login=login)
+                notifier.send_trade_opened_for_account({**acc, "balance": bal}, setup, lot, risk_usd, ticket)
                 print(f"[{_ts()}] Multi-Account: #{login} ({label}) -> {side.upper()} {lot} lot (Ticket #{ticket})")
             else:
                 err = order_res.get("error", "execution error") if order_res else "no response"
                 print(f"[{_ts()}] Multi-Account: Order failed for #{login}: {err}")
+                notifier.send(f"<b>{notifier.bot_tag(acc)}</b>\n❌ <b>{symbol} order rejected</b> — {err}", chat_id=acc.get("chat_id") or None)
 
         except Exception as e:
             print(f"[{_ts()}] Multi-Account execution exception on #{login}: {e}")
@@ -339,31 +473,104 @@ def _dispatch_setup_to_accounts(setup, side, grade, score, has_news=False):
     print(f"[{_ts()}] Multi-Account Dispatch Complete: {total_executed}/{len(active_accounts)} accounts filled.")
 
 
-def run_scan(kill_zone=None):
-    acc = bridge.get_account()
-    if not acc:
-        print(f"[{_ts()}] MT5 bridge offline — scan skipped.")
+_trend_scanned = set()   # {(symbol, date)} — one entry check per symbol per daily candle
+
+
+def run_trend_scan():
+    """Daily trend-following entries (config.STRATEGY == 'trend'). Safe to call every hour:
+    each symbol is evaluated once per new daily candle."""
+    if not bridge.get_account():
+        print(f"[{_ts()}] MT5 bridge offline — trend scan skipped.")
         return
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    balance = acc.get("balance", 0.0)
-    if balance < config.MIN_BALANCE:
-        print(f"[{_ts()}] Balance ${balance:.2f} < ${config.MIN_BALANCE:.2f} — trading paused.")
+    # Open-position / max-open / balance checks happen per account inside the dispatcher.
+    in_use = {(a.get("strategy") or "trend") for a in account_manager.get_active_accounts()}
+    variants = [v for v in trend_strategy.VARIANTS if v in in_use]
+    for symbol in config.TREND_SYMBOLS:
+        if (symbol, today) in _trend_scanned:
+            continue
+        df_d = dp.get_daily(symbol, count=300)
+        if df_d is None:
+            continue  # retry next hour
+        _trend_scanned.add((symbol, today))
+        for variant in variants:
+            v = trend_strategy.VARIANTS[variant]
+            setup = trend_strategy.entry_signal(symbol, df_d, variant)
+            if not setup:
+                print(f"[{_ts()}] Trend[{variant}] {symbol}: no new EMA{v['fast']}/{v['slow']} cross.")
+                continue
+            print(f"[{_ts()}] Trend[{variant}] {symbol}: EMA{v['fast']} crossed above EMA{v['slow']} — buying.")
+            _dispatch_setup_to_accounts(setup, "buy", setup["grade"], setup["score"], methods=(variant,))
+
+
+def manage_other_accounts():
+    """Logs the bridge into each extra active account (not the master), reconciles closed trades,
+    trails trend stops / exits, then logs back into the master. Runs hourly with the trend check."""
+    master = _master_login()
+    others = [a for a in account_manager.get_active_accounts() if int(a["login"]) != master]
+    switched = False
+    try:
+        for acc in others:
+            login = int(acc["login"])
+            if not trade_logger.get_open_trade_tickets(login, False):
+                continue
+            sw = bridge.switch_account(login, acc["password"], acc["server"])
+            switched = True
+            if not sw or "error" in sw:
+                print(f"[{_ts()}] Manage #{login}: switch failed: {sw}")
+                continue
+            info = bridge.get_account()
+            if info:
+                account_manager.update_account_balance(login, info.get("balance", 0.0), info.get("equity", 0.0), info.get("currency", "USD"))
+            check_closed_positions(login, is_master=False)
+            manage_open_positions(login, is_master=False)   # SMC: TP1 / breakeven / trailing / TTL
+            manage_trend_positions(login, is_master=False)  # trend: chandelier stop / EMA exit
+    finally:
+        if switched:
+            _restore_master()
+
+
+def manage_trend_positions(login=None, is_master=True):
+    """Raises trend-trade stops to the 3xATR chandelier level and exits when the EMAs cross back."""
+    if login is None:
+        login = _master_login()
+    open_tickets = trade_logger.get_open_trade_tickets(login, is_master)
+    if not open_tickets:
         return
-
-    daily_count = trade_logger.get_daily_trade_count()
-    if daily_count >= config.MAX_TRADES_DAY:
-        print(f"[{_ts()}] Daily trade limit ({config.MAX_TRADES_DAY}) reached. Skipping scan.")
-        return
-
-    if kill_zone:
-        kz_count = trade_logger.get_kill_zone_trade_count(kill_zone)
-        if kz_count >= config.MAX_TRADES_KILL_ZONE:
-            print(f"[{_ts()}] Kill zone trade limit ({config.MAX_TRADES_KILL_ZONE}) reached for {kill_zone}.")
-            return
-
     live_positions = bridge.get_positions()
-    if live_positions and len(live_positions) >= config.MAX_CONCURRENT:
-        print(f"[{_ts()}] Max concurrent positions ({config.MAX_CONCURRENT}) open. Skipping entries.")
+    if not live_positions:
+        return
+    live_by_ticket = {p["ticket"]: p for p in live_positions}
+    for ticket in open_tickets:
+        trade = trade_logger.get_trade_by_ticket(ticket)
+        pos = live_by_ticket.get(ticket)
+        if not trade or not pos or trade.get("trigger") not in trend_strategy.TRIGGERS:
+            continue
+        symbol = trade["symbol"]
+        df_d = dp.get_daily(symbol, count=300)
+        action, new_sl = trend_strategy.manage(df_d, trade["opened_at"], pos.get("sl", 0.0), trade.get("trigger"))
+        v = trend_strategy.VARIANTS[trend_strategy.TRIGGERS[trade.get("trigger")]]
+        if action == "exit" and _action_failures.get((ticket, "trend_exit"), 0) < 5:
+            res = bridge.close_position(ticket)
+            if res and "error" not in res:
+                notifier.send(f"<b>{_tag(login)}</b>\n📉 <b>Trend over — closed {symbol} #{ticket}</b>\nEMA{v['fast']} closed back below EMA{v['slow']}.")
+            else:
+                _action_failures[(ticket, "trend_exit")] = _action_failures.get((ticket, "trend_exit"), 0) + 1
+                print(f"[{_ts()}] Trend exit failed for #{ticket}: {res}")
+        elif action == "trail":
+            res = bridge.modify_sl(ticket, round(new_sl, 6))
+            if res and "error" not in res:
+                print(f"[{_ts()}] Trend {symbol} #{ticket}: stop raised to {new_sl:.5f}")
+            else:
+                print(f"[{_ts()}] Trend {symbol} #{ticket}: stop raise failed: {res}")
+
+
+def run_scan(kill_zone=None):
+    """SMC scanner. Signals go to accounts assigned 'smc' (mechanical) and/or 'smc_ai' (AI veto).
+    Balance, daily/kill-zone limits and open positions are checked per account in the dispatcher."""
+    if not bridge.get_account():
+        print(f"[{_ts()}] MT5 bridge offline — scan skipped.")
         return
 
     pairs_scanned = 0
@@ -388,7 +595,9 @@ def run_scan(kill_zone=None):
             has_news, news_title = news_filter.has_high_impact_news_soon(symbol, config.NEWS_LOOKOUT_MINS)
             if has_news:
                 print(f"[{_ts()}] {symbol}: High-impact news upcoming ('{news_title}'). Skipping.")
-                notifier.send(f"⏸️ <b>Scan Paused on {symbol}</b> — High-impact news event upcoming: <i>{news_title}</i>.")
+                if (symbol, news_title) not in _news_alerted:
+                    _news_alerted.add((symbol, news_title))
+                    notifier.send(f"⏸️ <b>Scan Paused on {symbol}</b> — High-impact news event upcoming: <i>{news_title}</i>.")
                 continue
 
             # 2b. [v3.2] Spread Check — skip if spread is too wide
@@ -433,68 +642,73 @@ def run_scan(kill_zone=None):
             if _last_signaled.get(symbol) == setup_key:
                 print(f"[{_ts()}] {symbol}: Duplicate setup (same direction + swing range). Skipping.")
                 continue
-            _last_signaled[symbol] = setup_key
 
-            # ── AI Institutional Gatekeeper & Trap Check ──
-            if getattr(config, "AI_ENABLED", False):
-                print(f"[{_ts()}] 🧠 Querying Dual-AI Engine for {symbol} validation...")
-                sym_info = bridge.get_symbol_info(symbol) if hasattr(bridge, "get_symbol_info") else {}
+            # ── Routing ──
+            # 'smc' accounts   : every A+ setup (mechanical rules only)
+            # 'smc_ai' accounts: A+ setups the AI approves, plus B+ setups the AI upgrades (old behaviour)
+            methods = []
+            if is_a_plus:
+                methods.append("smc")
+            ai_wanted = getattr(config, "AI_ENABLED", False) and any(
+                (a.get("strategy") or "trend") == "smc_ai" for a in account_manager.get_active_accounts())
+            if ai_wanted:
+                print(f"[{_ts()}] 🧠 Querying AI for {symbol} review...")
+                sym_info = bridge.get_symbol_info(symbol) or {}
                 market_ctx = {
-                    "rsi": setup.get("rsi", "N/A"),
                     "adx": setup.get("adx", "N/A"),
-                    "spread": sym_info.get("spread", "Normal") if sym_info else "Normal",
-                    "news": "Upcoming event monitored" if has_news else "Clean calendar",
+                    "spread": sym_info.get("spread", "Normal"),
+                    "news": "Clean calendar",
                 }
                 ai_eval = ai_engine.evaluate_setup(setup, market_ctx)
+                if ai_eval.get("provider") == "Safety Fail-Safe":
+                    time.sleep(5)  # Gemini 503/timeout is usually momentary — one retry
+                    ai_eval = ai_engine.evaluate_setup(setup, market_ctx)
                 verdict = ai_eval.get("verdict", "CAUTION")
                 conf = ai_eval.get("confidence", 0)
                 provider = ai_eval.get("provider", "AI")
                 trap = ai_eval.get("trap_detected", False)
-                narrative = ai_eval.get("narrative", "")
-                trap_warn = ai_eval.get("trap_warning", "None")
-
+                ai_down = provider == "Safety Fail-Safe"
                 print(f"[{_ts()}] AI Evaluation ({provider}): {verdict} ({conf}% conf) | Trap: {trap}")
+                if not ai_down:
+                    setup["ai_verdict"], setup["ai_conf"] = verdict, conf
+                    setup["ai_narrative"], setup["ai_provider"] = ai_eval.get("narrative", ""), provider
+                    min_conf = 85 if not is_a_plus else getattr(config, "AI_MIN_CONFIDENCE", 70)
+                    if verdict == "APPROVED" and not trap and conf >= min_conf:
+                        methods.append("smc_ai")
+                        if not is_a_plus:
+                            setup["grade"] = grade = "A+ (AI Confirmed)"
+                    else:
+                        print(f"[{_ts()}] {symbol}: AI vetoed for smc_ai accounts ({verdict}, {conf}%).")
+                elif is_a_plus:
+                    # AI unreachable: smc_ai accounts do NOT trade it. That account measures the AI-gated
+                    # system as designed (fail-safe reject), including what it misses during outages;
+                    # the plain 'smc' account still takes the setup.
+                    print(f"[{_ts()}] {symbol}: AI unreachable — smc_ai skips, smc accounts still trade it.")
+                else:
+                    continue  # AI down: B+ can't be upgraded; retry next scan (not marked as signaled)
 
-                # B+ candidate upgrade gate: requires high conviction (>=85% conf & APPROVED)
-                if not is_a_plus:
-                    if verdict != "APPROVED" or conf < 85 or trap:
-                        print(f"[{_ts()}] {symbol}: B+ setup not upgraded by AI ({verdict}, {conf}% conf). Skipping.")
-                        continue
-                    print(f"[{_ts()}] 🌟 AI Upgraded B+ setup to Tradeable! ({conf}% conf)")
-                    grade = "A+ (AI Confirmed)"
-                    setup["grade"] = grade
+            if not methods:
+                _last_signaled[symbol] = setup_key
+                print(f"[{_ts()}] {symbol}: no account method accepted this setup.")
+                continue
 
-                # A+ candidate gate: check for traps & minimum confidence
-                if trap or verdict == "REJECTED" or conf < getattr(config, "AI_MIN_CONFIDENCE", 70):
-                    print(f"[{_ts()}] {symbol}: Filtered by AI Gatekeeper ({verdict}, {conf}% conf, trap={trap}). Skipping.")
-                    notifier.send(
-                        f"🛡️ <b>AI Gatekeeper Filtered {symbol}</b>\n\n"
-                        f"Verdict: <b>{verdict} ({conf}% confidence)</b>\n"
-                        f"Trap Warning: <i>{trap_warn}</i>\n"
-                        f"Analysis: <i>{narrative}</i>\n"
-                        f"<i>Capital protected from high-risk entry.</i>"
-                    )
-                    continue
-
-                setup["ai_verdict"] = verdict
-                setup["ai_conf"] = conf
-                setup["ai_narrative"] = narrative
-                setup["ai_provider"] = provider
-
+            _last_signaled[symbol] = setup_key
             setups_found += 1
 
             # 5. Multi-Account Execution Dispatch
             side = "buy" if setup["direction"] == "bullish" else "sell"
-            _dispatch_setup_to_accounts(setup, side, grade, score, has_news=has_news)
+            _dispatch_setup_to_accounts(setup, side, grade, score, methods=tuple(methods), kill_zone=kill_zone)
 
         except Exception as e:
             print(f"[{_ts()}] Scan error on {symbol}: {e}")
             traceback.print_exc()
 
-    # Send scan summary to Telegram after every scan cycle
-    open_trades = len(bridge.get_positions() or [])
-    week_count = trade_logger.get_daily_trade_count()
-    notifier.send_scan_summary(pairs_scanned, setups_found, open_trades, week_count)
+    # Telegram summary: only when something was found, or at 4H closes outside kill zones
+    # (kill zones scan every 15 min, which used to flood the chat).
+    if setups_found or not kill_zone:
+        open_trades = len(bridge.get_positions() or [])
+        day_count = trade_logger.get_daily_trade_count()
+        notifier.send_scan_summary(pairs_scanned, setups_found, open_trades, day_count)
 
 
 def _send_welcome_menu(chat_id=None):
@@ -513,6 +727,7 @@ def _send_welcome_menu(chat_id=None):
         f"⚡ <b>AutoTrading:</b> <b>ACTIVE & READY ✅</b>\n\n"
         "<b>👇 Tap any 1-Click Shortcut Button below:</b>\n\n"
         "• <b>➕ Connect Account</b> — Add your MT5 account in 30s\n"
+        "• <b>🏆 Scoreboard</b> — Which bot is winning (P&L per account)\n"
         "• <b>👥 My Accounts</b> — View, pause or manage all accounts\n"
         "• <b>🧬 Agent Evolution</b> — AI Generation & empirical axioms\n"
         "• <b>🏦 Balance & Status</b> — Live MT5 equity and margin\n"
@@ -860,26 +1075,59 @@ def _handle_show_accounts(chat_id, user_id=None):
     if not accounts:
         notifier.send("ℹ️ No accounts registered yet. Tap <b>➕ Connect Account</b> to link one!", chat_id=chat_id)
         return
-        
-    lines = [f"👥 <b>Connected Trading Accounts ({len(accounts)} Total)</b>\n"]
-    for idx, a in enumerate(accounts, 1):
-        status = "🟢 <b>ACTIVE</b>" if a["is_active"] else "⏸️ <b>PAUSED</b>"
-        bal_str = f"${a.get('balance', 0.0):.2f}"
+
+    lines = [f"👥 <b>Your {len(accounts)} trading bots</b>\n"]
+    for a in accounts:
+        status = "🟢" if a["is_active"] else "⏸️ PAUSED"
         lines.append(
-            f"<b>{idx}. {status} — {a.get('label', 'Account')}</b>\n"
-            f"   • Login: <code>#{a['login']}</code>\n"
-            f"   • Server: {a['server']}\n"
-            f"   • Balance: {bal_str} {a.get('currency', 'USD')}\n"
-            f"   • Risk: {a.get('risk_pct', 1.0)}% per trade\n"
+            f"{status} <b>{notifier.bot_tag(a)}</b>\n"
+            f"   Balance ${a.get('balance', 0.0):.2f} · Risk {a.get('risk_pct', 1.0)}% · {a['server']}\n"
         )
     lines.append(
-        "<b>👇 1-Click Action Shortcuts:</b>\n"
-        "• Tap <b>➕ Connect Account</b> to link another MT5 account\n"
-        "• <code>/pause [login]</code> — Temporarily pause trade copying\n"
-        "• <code>/resume [login]</code> — Resume trade copying\n"
-        "• <code>/risk [login] [pct]</code> — Change risk (e.g. <code>/risk 436015341 1.5</code>)\n"
-        "• <code>/remove [login]</code> — Disconnect an account from the bot"
+        "🏆 /scoreboard — who is winning\n"
+        "<code>/strategy [login] [trend|trend_fast|smc|smc_ai]</code> · <code>/risk [login] [pct]</code>\n"
+        "<code>/pause [login]</code> · <code>/resume [login]</code> · <code>/remove [login]</code>"
     )
+    notifier.send("\n".join(lines), chat_id=chat_id)
+
+
+def _handle_scoreboard(chat_id=None):
+    """Refreshes each account's live balance, then ranks the bots by profit."""
+    notifier.send_typing(chat_id)
+    accounts = account_manager.get_active_accounts()
+    master = _master_login()
+    try:
+        for a in accounts:
+            login = int(a["login"])
+            if login != master:
+                sw = bridge.switch_account(login, a["password"], a["server"])
+                if not sw or "error" in sw:
+                    continue
+            info = bridge.get_account()
+            if info and int(info.get("login", 0)) == login:
+                account_manager.update_account_balance(login, info.get("balance", 0.0), info.get("equity", 0.0), info.get("currency", "USD"))
+    finally:
+        _restore_master()
+
+    stats = trade_logger.stats_by_login()
+    rows = []
+    for a in account_manager.get_active_accounts():
+        st = stats.get(int(a["login"]), {})
+        rows.append((st.get("net", 0.0), a, st))
+    rows.sort(key=lambda r: r[0], reverse=True)
+
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣"]
+    lines = ["🏆 <b>SCOREBOARD</b> — bots ranked by closed-trade profit\n"]
+    for i, (net, a, st) in enumerate(rows):
+        closed = st.get("closed", 0)
+        wr = f"{st['wins'] / closed * 100:.0f}%" if closed else "–"
+        sign = "+" if net >= 0 else "-"
+        lines.append(
+            f"{medals[i] if i < len(medals) else '•'} <b>{notifier.bot_tag(a)}</b>\n"
+            f"   P&L <b>{sign}${abs(net):.2f}</b> · {closed} closed ({st.get('wins', 0)}W/{st.get('losses', 0)}L, {wr}) · {st.get('open', 0)} open\n"
+            f"   Balance <b>${a.get('balance', 0.0):.2f}</b> · best +${st.get('best', 0.0):.2f} · worst -${abs(st.get('worst', 0.0)):.2f}\n"
+        )
+    lines.append(f"<i>Updated {_ts()}</i>")
     notifier.send("\n".join(lines), chat_id=chat_id)
 
 
@@ -912,6 +1160,18 @@ def _handle_account_quick_command(item):
             target_login = int(parts[1].replace("#", ""))
             account_manager.delete_account(target_login)
             notifier.send(f"🗑️ <b>Account #{target_login} Disconnected.</b> Removed from trading registry.", chat_id=chat_id)
+            return True
+        except ValueError:
+            pass
+
+    if cmd == "/strategy" and len(parts) >= 3:
+        try:
+            target_login = int(parts[1].replace("#", ""))
+            strat = parts[2].lower()
+            if account_manager.set_account_strategy(target_login, strat):
+                notifier.send(f"🧭 <b>Account #{target_login} now trades:</b> {strat}", chat_id=chat_id)
+            else:
+                notifier.send(f"⚠️ Unknown account or strategy. Use one of: {', '.join(account_manager.STRATEGIES)}", chat_id=chat_id)
             return True
         except ValueError:
             pass
@@ -956,6 +1216,8 @@ def handle_telegram_commands():
                 chat_id=chat_id,
                 custom_keyboard=notifier.SERVER_SHORTCUTS_KEYBOARD
             )
+        elif text in ("🏆 Scoreboard", "Scoreboard") or cmd in ("/scoreboard", "/score", "/winner") or lower_text == "scoreboard":
+            _handle_scoreboard(chat_id)
         elif text in ("👥 My Accounts", "My Accounts") or cmd in ("/accounts", "/myaccounts"):
             _handle_show_accounts(chat_id, user_id)
         elif _handle_account_quick_command(item):
@@ -1038,11 +1300,11 @@ def _send_report():
     week = bridge.get_report("week")
     
     if "error" in today or "error" in week:
-        notifier.send("?????? <b>Report Failed:</b> Could not fetch deals from bridge.")
+        notifier.send("⚠️ <b>Report Failed:</b> Could not fetch deals from bridge.")
         return
-        
+
     msg = (
-        f"???? <b>Performance Report</b>\n\n"
+        f"📈 <b>Performance Report</b>\n\n"
         f"<b>TODAY:</b>\n"
         f"Profit: ${today.get('profit', 0.0):.2f}\n"
         f"Trades: {today.get('total_trades', 0)} ({today.get('wins', 0)}W - {today.get('losses', 0)}L)\n"
@@ -1114,6 +1376,8 @@ def main():
         )
 
     last_scan_slot  = (-1, -1)
+    last_trend_slot = None
+    last_other_check = 0.0
     last_ema_check  = 0.0
     weekly_report_sent = False
     last_tp_check   = 0.0
@@ -1156,23 +1420,43 @@ def main():
                 except Exception as e:
                     print(f"[{_ts()}] Auto news error: {e}")
 
-            # Kill Zone & 4H Candle Close Scans
-            kz   = current_kill_zone()
-            slot = (h, (m // 15) * 15)
+            # Which methods are in use is decided by the accounts (accounts.strategy).
+            in_use = {(a.get("strategy") or "trend") for a in account_manager.get_active_accounts()} \
+                or {getattr(config, "STRATEGY", "trend")}
 
-            should_scan = False
-            if kz:
-                if slot != last_scan_slot:
-                    should_scan = True
-            else:
-                if h in config.SCAN_HOURS and m == 0 and slot != last_scan_slot:
-                    should_scan = True
+            # Extra accounts: reconcile closes + manage stops every 5 minutes
+            if time.time() - last_other_check >= 300:
+                manage_other_accounts()
+                last_other_check = time.time()
 
-            if should_scan:
-                label = f"KILL ZONE ({kz.upper()})" if kz else "4H CLOSE"
-                print(f"\n[{_ts()}] ── {label} — scanning ──")
-                run_scan(kill_zone=kz)
-                last_scan_slot = slot
+            if in_use & set(trend_strategy.VARIANTS):
+                # Daily trend strategy: once an hour (5 min past) — entries fire once per new daily
+                # candle, stops are trailed on the latest daily close.
+                hour_slot = (now.strftime("%Y-%m-%d"), h)
+                if m >= 5 and hour_slot != last_trend_slot:
+                    print(f"\n[{_ts()}] ── TREND CHECK ──")
+                    manage_trend_positions()
+                    run_trend_scan()
+                    last_trend_slot = hour_slot
+
+            if in_use & {"smc", "smc_ai"}:
+                # Kill Zone & 4H Candle Close Scans
+                kz   = current_kill_zone()
+                slot = (h, (m // 15) * 15)
+
+                should_scan = False
+                if kz:
+                    if slot != last_scan_slot:
+                        should_scan = True
+                else:
+                    if h in config.SCAN_HOURS and m == 0 and slot != last_scan_slot:
+                        should_scan = True
+
+                if should_scan:
+                    label = f"KILL ZONE ({kz.upper()})" if kz else "4H CLOSE"
+                    print(f"\n[{_ts()}] ── {label} — SMC scanning ──")
+                    run_scan(kill_zone=kz)
+                    last_scan_slot = slot
 
             time.sleep(15)
 

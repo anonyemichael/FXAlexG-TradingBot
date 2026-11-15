@@ -15,6 +15,7 @@ Implements:
 
 import pandas as pd
 import numpy as np
+import config
 from config import (
     AOI_TOLERANCE, AOI_MIN_TOUCHES, SWING_WINDOW,
     EMA_FAST, EMA_SLOW, EMA_TREND,
@@ -118,9 +119,12 @@ def get_swing_range(df, lookback=30):
     eq   = (high + low) / 2.0
     rng  = high - low
     
-    # 61.8% OTE retracement boundaries
-    discount_ote = low + 0.618 * rng  # Below this is deep/valid discount for buying
-    premium_ote  = high - 0.618 * rng # Above this is deep/valid premium for selling
+    # Entry zone boundaries. ENTRY_ZONE_MAX = 0.5 means longs only below equilibrium (discount)
+    # and shorts only above it (premium). The old hard-coded 0.618 let longs fire at 61.8% of
+    # the range, i.e. in premium.
+    zone = getattr(config, "ENTRY_ZONE_MAX", 0.5)
+    discount_ote = low + zone * rng
+    premium_ote  = high - zone * rng
     
     return {
         "high": high,
@@ -365,21 +369,25 @@ def check_shift_of_structure(df, direction, window=3):
 
 # ── 15M CHoCH & Order Blocks ────────────────────────────────────────────────
 
-def detect_15m_sweep_and_choch(df_15m, direction, lookback=40):
+def detect_15m_sweep_and_choch(df_15m, direction, lookback=40, symbol=""):
     if len(df_15m) < lookback + 5:
         return None
     recent = df_15m.iloc[-lookback:]
     curr = df_15m.iloc[-2]
     atr = float(df_15m["atr"].iloc[-2]) if "atr" in df_15m.columns else (float(curr["high"]) - float(curr["low"]))
-    
-    # Autonomous Policy Adaptive Buffer: prevents 1-pip noise stop-outs
+
+    # Noise buffer beyond the sweep wick. Previously this tested the DataFrame's column names
+    # for "JPY"/"BTC", which never matched, so every symbol got the 12-pip forex floor.
+    sym = symbol.upper()
     min_buffer = 1.5 * atr
-    if "JPY" in str(df_15m.columns):
+    if "JPY" in sym:
         min_buffer = max(min_buffer, 0.12)
-    elif any(k in str(df_15m.columns) for k in ("BTC", "ETH", "SOL")):
-        min_buffer = max(min_buffer, float(curr["close"]) * 0.010) # 1% floor for crypto
+    elif any(k in sym for k in ("BTC", "ETH", "SOL", "XRP", "LTC")):
+        min_buffer = max(min_buffer, float(curr["close"]) * 0.010)  # 1% floor for crypto
+    elif "XAU" in sym:
+        min_buffer = max(min_buffer, 3.0)
     else:
-        min_buffer = max(min_buffer, 0.0012) # 12 pips floor for forex
+        min_buffer = max(min_buffer, 0.0012)  # 12 pips floor for forex
 
     if direction == "bullish":
         swing_low = float(recent["low"].iloc[:-3].min())
@@ -647,7 +655,7 @@ def analyze_pair(symbol, df_w, df_d, df_4h, df_15m=None, in_kill_zone=False):
             if synced < MIN_TF_SYNC_KZ:
                 continue
 
-            choch = detect_15m_sweep_and_choch(df_15m, direction)
+            choch = detect_15m_sweep_and_choch(df_15m, direction, symbol=symbol)
             if choch and choch["rr"] >= MIN_RR:
                 at_fvg = find_fvg_near_price(df_15m, direction, choch["entry"])
                 if at_fvg or aoi_found:

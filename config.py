@@ -57,18 +57,44 @@ ACCOUNTS = {
 }
 ACTIVE_ACCOUNT = os.getenv("ACTIVE_ACCOUNT", "demo")  # Default fallback; overwritten by active_account.json
 
-# Pairs to scan (Includes Gold XAUUSDm for high volatility & faster profit)
-SYMBOLS = ["EURUSDm", "GBPUSDm", "USDJPYm", "AUDUSDm", "USDCADm", "EURJPYm", "GBPJPYm", "BTCUSDm", "ETHUSDm", "XAUUSDm", "SOLUSDm", "XRPUSDm", "LTCUSDm"]
+# --- Strategy selection ---
+# "trend": daily EMA20/100 trend-following, long-only, 3xATR trailing stop (trend_strategy.py).
+#          Walk-forward tested 2019–2026: profitable in both halves and across all nearby settings;
+#          $20 @ 2% risk -> ~$68, max drawdown ~14% (trend_research.py).
+# "smc"  : the original ICT/SMC scanner — backtested NEGATIVE (profit factor 0.6–0.9). Not recommended.
+STRATEGY = "trend"
+# Coins with a small enough minimum lot for a $20 account and spread < 1%.
+# (LTC excluded: 3.4% spread. Forex/gold/BTC/ETH: minimum lot risks 17–300% of $20 per daily ATR.)
+# BNB/BTC/ETH added 2026-11-03 for more trades (~9/yr instead of ~5; 7-coin backtest PF 3.41, both halves
+# profitable). Their minimum lot is too big for ~$20, so small accounts skip them automatically.
+TREND_SYMBOLS  = ["SOLUSDm", "XRPUSDm", "ADAUSDm", "DOGEUSDm", "BNBUSDm", "BTCUSDm", "ETHUSDm"]
+TREND_MAX_OPEN = 4
+TREND_EMA_FAST = 20
+TREND_EMA_SLOW = 100
+TREND_STOP_ATR = 3.0
+
+# Pairs to scan (SMC strategy only)
+# XAUUSDm removed 2026-11-03: real MT5 history (May–Oct 2026) shows gold lost $270 of the $289 total
+# (11 of 12 trades lost, all 5 margin stop-outs); everything else was about break-even. Its 0.01 minimum
+# lot risks $20–90 per stop, far too big for small accounts. Add it back only on an account of $1,000+.
+# Best 5 (owner's request, 2026-11-03): each was profitable in real MT5 history or in the 4-year backtest.
+# BTC +$29 real, EURJPY +$14 real, GBPUSD best in backtest, GBPJPY positive in backtest, ETH ~break-even real.
+# Dropped EURUSD/USDJPY/AUDUSD/USDCAD (lost in both) and SOL/XRP/LTC (no record with this method).
+SYMBOLS = ["BTCUSDm", "EURJPYm", "GBPUSDm", "GBPJPYm", "ETHUSDm"]
 
 # --- High-Growth Lot Size & Risk Engine ---
 # Targets $3.50 - $5.00 risk per trade to yield $10.00+ on winning trades
-USE_FIXED_LOT   = False  
-RISK_PERCENT    = 7.5    # 7.5% of balance (or minimum $3.50) to deliver $10+ profit per win
+USE_FIXED_LOT   = False
+# AGGRESSIVE growth profile (owner's choice). Trend strategy backtest 2019–2026, $20 start:
+#   2% -> $68 (maxDD 14%) | 5% -> $139 (25%) | 8% -> $298 (38%) | 10% -> $478 (46%, low point $12)
+# Each trade still has a hard broker-side stop loss; the cap stops min-lot rounding from going wild.
+RISK_PERCENT    = 10.0
 FIXED_LOT       = 0.01   # Fallback lot size if calculation fails
 
-MIN_RISK_USD    = 1.50   # Floor: risk at least $1.50 to protect micro accounts
-MAX_RISK_PCT    = 10.0   # Hard safety cap: never risk more than 10% on a single trade
-MAX_RISK_USD    = 15.0   # Hard dollar cap
+MIN_RISK_USD    = 0.0    # No forced minimum
+MAX_RISK_PCT    = 35.0   # Hard cap per trade. Owner chose 35% (2026-11-03) so SMC 4H setups fit $20 accounts
+                         # (a 4H stop at the 0.01 minimum lot costs ~$6-7 = 30-35% of $20).
+MAX_RISK_USD    = 1000.0 # Dollar cap high enough not to block compounding
 MIN_BALANCE     = 5.0    # USD — bot pauses if balance falls below this
 
 # Trade Frequency & Concurrency
@@ -79,11 +105,11 @@ NEWS_LOOKOUT_MINS    = 30 # Skip entry if high-impact news within 30 min
 
 # --- Take Profit, Risk-Reward & Trailing Stop ---
 MIN_RR            = 2.0   # Minimum RR ratio required to accept a setup
-TP1_RR            = 1.0   # Take 50% partial profit at 1:1.0 RR (banks quick cash & moves SL to BE)
-TP2_RR            = 3.0   # Extended Final Take Profit target at 1:3.0 RR (Yields $10+ on full TP)
-PARTIAL_PCT       = 0.5   # Close 50% of position at TP1
+TP1_RR            = 1.5   # Take 50% partial profit at 1:1.5 RR and move SL to breakeven
+TP2_RR            = 3.5   # Final Take Profit at 1:3.5 RR
+PARTIAL_PCT       = 0.5   # Close 50% of position at TP1 (skipped automatically if lot is at broker minimum)
 USE_TRAILING_STOP = True  # Trail SL behind 15M EMA21 after TP1
-TRAILING_STOP_BUFFER = 5  # Pips buffer
+TRAILING_STOP_BUFFER = 15 # Pips buffer
 
 # Trade Lifecycle
 MAX_TRADE_LIFESPAN_HOURS = 36 # Close trade if TP1 not hit within 36h
@@ -115,7 +141,12 @@ AI_TIMEOUT               = 45     # Extended to 45s for complete institutional a
 AI_MAX_RETRIES           = 3      # Exponential backoff retries against transient rate-limits
 AI_CONFIRMATION_REQUIRED = True   # AI evaluates all candidate setups before opening orders
 AI_MIN_CONFIDENCE        = 70     # Minimum AI confidence (0-100) to approve trade
-AI_UPGRADE_B_PLUS        = True   # AI can upgrade high-scoring B+ (80+) setups if confidence >= 85
+AI_UPGRADE_B_PLUS        = True   # AI can upgrade high-scoring B+ (80+) setups if confidence >= 85 (veto mode only)
+# "advisory" = AI comment attached to alerts, mechanical rules decide (default)
+# "veto"     = AI can block trades / upgrade B+ (old behaviour — blocks everything when Gemini is down)
+# "off"      = no AI call during scans
+AI_GATE_MODE             = "advisory"
+AI_AUTO_TRAIN            = False  # Rewriting policy after every close learned from 12 trades + a mis-logged result
 AI_POST_TRADE_REVIEW     = True   # AI reviews won/lost trades for learning
 AI_SESSION_PULSE         = True   # Macro pulse broadcast after scan
 
@@ -138,6 +169,7 @@ NORMAL_SPREAD_POINTS = {
 MAX_SPREAD_MULT = 3
 
 # Strategy Parameters
+ENTRY_ZONE_MAX  = 0.5    # Longs only in lower 50% of 4H dealing range (discount), shorts upper 50% (premium)
 AOI_TOLERANCE   = 0.0025 # 0.25% zone tolerance
 AOI_MIN_TOUCHES = 2
 SWING_WINDOW    = 3

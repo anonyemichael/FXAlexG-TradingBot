@@ -60,11 +60,11 @@ def discover_chat_id():
 
 DEFAULT_KEYBOARD = {
     "keyboard": [
-        [{"text": "➕ Connect Account"}, {"text": "👥 My Accounts"}],
+        [{"text": "🏆 Scoreboard"},     {"text": "👥 My Accounts"}],
         [{"text": "📊 Market Pulse"},   {"text": "🏦 Balance & Status"}],
         [{"text": "🧬 Agent Evolution"}, {"text": "📈 P&L Report"}],
         [{"text": "🥇 Gold"}, {"text": "💶 EUR/USD"}, {"text": "₿ Bitcoin"}],
-        [{"text": "📰 Today's News"},   {"text": "⚙️ Help & Menu"}]
+        [{"text": "📰 Today's News"},   {"text": "➕ Connect Account"}, {"text": "⚙️ Help & Menu"}]
     ],
     "resize_keyboard": True,
     "persistent": True
@@ -193,6 +193,25 @@ def send_typing(chat_id=None):
         return False
 
 
+# ── Which bot is talking ──────────────────────────────────────────────────
+# Every trade message starts with the account's method + login, so 4 accounts never get mixed up.
+METHOD_NAMES = {
+    "trend":  "📈 Crypto Trend",
+    "trend_fast": "⚡ Crypto Trend Fast",
+    "smc":    "🎯 SMC (yours)",
+    "smc_ai": "🧠 SMC + AI",
+}
+
+
+def bot_tag(acc):
+    """'🎯 SMC (yours) · #477674441' from an accounts.db row (or {'login':…, 'strategy':…})."""
+    acc = acc or {}
+    method = (acc.get("strategy") or getattr(config, "STRATEGY", "trend")).lower()
+    name = METHOD_NAMES.get(method, method)
+    login = acc.get("login")
+    return f"{name} · #{login}" if login else name
+
+
 def send_trade_opened(setup, lot, risk_usd, risk_pct):
     emoji = "🟢" if setup["direction"] == "bullish" else "🔴"
     side  = "LONG" if setup["direction"] == "bullish" else "SHORT"
@@ -219,30 +238,22 @@ def send_trade_opened(setup, lot, risk_usd, risk_pct):
 
 
 def send_trade_opened_for_account(acc, setup, lot, risk_usd, ticket):
-    emoji = "🟢" if setup["direction"] == "bullish" else "🔴"
-    side  = "LONG" if setup["direction"] == "bullish" else "SHORT"
-    sym   = setup["symbol"]
-    login = acc.get("login")
-    label = acc.get("label", f"Account #{login}")
-    chat_id = acc.get("chat_id")
-
+    side  = "BUY" if setup["direction"] == "bullish" else "SELL"
+    emoji = "🟢" if side == "BUY" else "🔴"
+    bal = acc.get("balance") or 0
+    pct = f" ({risk_usd / bal * 100:.1f}%)" if bal else ""
+    tp = setup.get("tp2") or setup.get("tp")
     msg = (
-        f"{emoji} <b>TRADE OPENED — {sym} {side}</b>\n\n"
-        f"👤 Account: <b>{label} (#{login})</b>\n"
-        f"💰 Entry:   <b>{setup['entry']}</b>\n"
-        f"🛑 SL:      <b>{setup['sl']}</b>\n"
-        f"🎯 TP1:     <b>{setup.get('tp1', 'N/A')}</b>\n"
-        f"🎯 TP2:     <b>{setup.get('tp2', setup['tp'])}</b>\n"
-        f"📊 RR:      <b>1:{setup['rr']}</b>\n"
-        f"📦 Lots:    <b>{lot}</b>\n"
-        f"💵 Risk:    <b>${risk_usd:.2f} ({acc.get('risk_pct', 1.0)}%)</b>\n"
-        f"🎫 Ticket:  <b>#{ticket}</b>\n\n"
-        f"⏰ {datetime.utcnow().strftime('%d %b %Y %H:%M')} UTC"
+        f"<b>{bot_tag(acc)}</b>\n"
+        f"{emoji} <b>OPENED {side} {setup['symbol']}</b>\n\n"
+        f"Entry:  <b>{setup['entry']}</b>\n"
+        f"Stop:   <b>{setup['sl']}</b>  (risk <b>${risk_usd:.2f}</b>{pct})\n"
+        f"Target: <b>{tp if tp else 'none — trails the trend'}</b>\n"
+        f"Lots:   {lot}  ·  Ticket #{ticket}\n"
+        f"Setup:  {setup.get('trigger', '')} {setup.get('grade', '')}\n"
+        f"⏰ {datetime.utcnow().strftime('%d %b %H:%M')} UTC"
     )
-    if chat_id:
-        send(msg, chat_id=chat_id)
-    else:
-        send(msg)
+    send(msg, chat_id=acc.get("chat_id") or None)
 
 
 def send_trade_closed(symbol, direction, result_usd, balance, week_count):
@@ -260,14 +271,10 @@ def send_trade_closed(symbol, direction, result_usd, balance, week_count):
 
 
 def send_scan_summary(pairs_scanned, setups_found, open_trades, week_count):
-    acct = config.ACCOUNTS.get(config.ACTIVE_ACCOUNT, {}).get("label", config.ACTIVE_ACCOUNT)
     msg = (
-        f"🔍 <b>SCAN COMPLETE — {datetime.utcnow().strftime('%d %b %Y %H:%M')} UTC</b>\n\n"
-        f"Pairs scanned:  {pairs_scanned}\n"
-        f"A+/B+ setups:  {setups_found}\n"
-        f"Open trades:   {open_trades}\n"
-        f"Week trades:   {week_count}/2\n"
-        f"Account:       {acct}\n"
+        f"<b>🎯 SMC scanner</b> (SMC + SMC-AI bots)\n"
+        f"🔍 Scan {datetime.utcnow().strftime('%d %b %H:%M')} UTC — {pairs_scanned} pairs, "
+        f"<b>{setups_found}</b> setup(s), {week_count}/{config.MAX_TRADES_DAY} trades today\n"
     )
     if setups_found == 0:
         msg += "\n⏳ No valid setups — waiting for next 4H close."
@@ -361,29 +368,3 @@ def send_weekly_outlook(analyses):
         send(part2)
     else:
         send(msg)
-
-
-def send_trade_opened_for_account(acc, setup, lot, risk_usd, ticket):
-    emoji = "🟢" if setup["direction"] == "bullish" else "🔴"
-    side  = "LONG" if setup["direction"] == "bullish" else "SHORT"
-    sym   = setup["symbol"]
-    login = acc.get("login")
-    label = acc.get("label", f"Account #{login}")
-    chat_id = acc.get("chat_id")
-
-    msg = (
-        f"{emoji} <b>TRADE OPENED — {sym} {side}</b>\n\n"
-        f"👤 Account: <b>{label} (#{login})</b>\n"
-        f"💰 Entry:   <b>{setup['entry']}</b>\n"
-        f"🛑 SL:      <b>{setup['sl']}</b>\n"
-        f"🎯 TP1:     <b>{setup.get('tp1', 'N/A')}</b>\n"
-        f"🎯 TP2:     <b>{setup.get('tp2', setup['tp'])}</b>\n"
-        f"📊 RR:      <b>1:{setup['rr']}</b>\n"
-        f"📦 Lots:    <b>{lot}</b>\n"
-        f"💵 Risk:    <b>${risk_usd:.2f} ({acc.get('risk_pct', 1.0)}%)</b>\n"
-        f"🎫 Ticket:  <b>#{ticket}</b>\n\n"
-        f"⏰ {datetime.utcnow().strftime('%d %b %Y %H:%M')} UTC"
-    )
-    if chat_id:
-        send(msg, chat_id=chat_id)
-    send(msg)

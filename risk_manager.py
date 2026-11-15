@@ -118,7 +118,8 @@ def calculate_lot_size(symbol, sl_dist, balance, target_risk_usd=None, risk_pct=
     if risk_pct > MAX_RISK_PCT or actual_risk_usd > MAX_RISK_USD:
         max_allowed_dollar = min(MAX_RISK_USD, balance * (MAX_RISK_PCT / 100.0))
         safe_raw_lot = max_allowed_dollar / max(loss_per_lot, 1e-6)
-        safe_lot = round(round(safe_raw_lot / step) * step, 2)
+        # Round DOWN: rounding to nearest turned 0.0067 lot into 0.01 and let a 30% risk through a 20% cap.
+        safe_lot = round(math.floor(safe_raw_lot / step + 1e-9) * step, 2)
 
         if safe_lot < vol_min:
             # Fatal Risk Mismatch: The minimum broker order size carries more risk than the account allows.

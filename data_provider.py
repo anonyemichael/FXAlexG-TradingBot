@@ -3,6 +3,8 @@ Market data via MT5 bridge — pulls directly from MT5 running on Oracle.
 No yfinance, no Yahoo rate limits.
 """
 
+import time
+
 import requests
 import pandas as pd
 from datetime import timezone
@@ -23,8 +25,15 @@ def _fetch(symbol, timeframe, count):
     sym = SYMBOL_MAP.get(symbol, symbol)
     url = f"{config.BRIDGE_URL}/ohlcv/{sym}/{timeframe}/{count}"
     try:
-        r = requests.get(url, timeout=15)
-        data = r.json()
+        data = None
+        for attempt in range(3):  # bridge is single-threaded; a busy moment shouldn't drop the scan
+            try:
+                data = requests.get(url, timeout=30).json()
+                break
+            except Exception:
+                if attempt == 2:
+                    raise
+                time.sleep(2 * (attempt + 1))
         if "error" in data:
             print(f"[data] {symbol} {timeframe}: bridge error — {data['error']}")
             return None
