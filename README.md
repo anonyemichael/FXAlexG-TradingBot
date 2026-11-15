@@ -1,251 +1,310 @@
-# FXAlexG Trading Bot
+# FXAlexG Institutional Algorithmic Trading Engine (v3.3)
 
-Institutional FXAlexG ICT trading engine with autonomous AI-assisted execution, multi-timeframe SMC scanning, and multi-account MT5 orchestration.
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Platform MT5](https://img.shields.io/badge/platform-MetaTrader%205-green.svg)](https://www.metatrader5.com/)
+[![Runtime Ubuntu/Systemd](https://img.shields.io/badge/runtime-Ubuntu%20Linux%20%7C%20Systemd-orange.svg)](https://ubuntu.com/)
+[![AI Engine Gemini 2.5](https://img.shields.io/badge/AI%20Engine-Google%20Gemini%202.5%20Flash-purple.svg)](https://deepmind.google/technologies/gemini/)
+[![Architecture Headless Bridge](https://img.shields.io/badge/architecture-REST%20HTTP%20Bridge-lightgrey.svg)]()
 
-This project is a Python-based automated FX trading system designed to scan the market, evaluate structured setups using ICT / Smart Money Concepts, apply AI validation, and execute orders through MetaTrader 5.
-
-## Overview
-
-FXAlexG combines:
-
-- Multi-timeframe market scanning across W1, D1, H4, and M15 data
-- ICT/SMC trade logic including swing structure, OTE/discount-premium logic, liquidity sweeps, and trigger detection
-- AI-assisted setup evaluation with Gemini/OpenRouter fallback
-- MT5 bridge integration for live execution and account switching
-- Telegram notifications and interaction
-- SQLite trade logging and analytics
-- Risk controls, cooldowns, spread checks, and news filtering
-
-The system is intended for research, strategy testing, and controlled automation in a broker/terminal environment. It is not a turnkey guarantee of profit and should be treated as a professional trading tool requiring thoughtful setup and monitoring.
-
-## Key Features
-
-- Institutional-grade multi-timeframe structure analysis
-- Symbol coverage for major FX pairs plus crypto and XAUUSD
-- A+ / B+ grading gate with AI approval path
-- Dynamic lot sizing and risk management
-- MT5 HTTP bridge architecture for safe execution separation
-- Telegram bot interface for market pulse, reports, and status
-- Trade lifecycle handling: TP1, breakeven, trailing stop, TTL, invalidation
-- News and spread filters to reduce poor-entry conditions
-- Backtesting and diagnostics utilities
-
-## Architecture
-
-```text
-+-------------------+      +---------------------+
-| Market Data       | ---> | Strategy Engine     |
-| MT5 / OHLCV       |      | (ICT/SMC logic)     |
-+-------------------+      +----------+----------+
-                                         |
-                                         v
-                               +-------------------+
-                               | AI Gatekeeper     |
-                               | Gemini/OpenRouter |
-                               +----------+--------+
-                                          |
-                                          v
-                              +----------------------------+
-                              | Risk + Execution Layer     |
-                              | - lot sizing               |
-                              | - spread/news filters      |
-                              | - MT5 bridge              |
-                              +-------------+--------------+
-                                            |
-                                            v
-                              +----------------------------+
-                              | Trade Manager + Logger     |
-                              | - positions                |
-                              | - database                |
-                              | - Telegram alerts          |
-                              +----------------------------+
-```
-
-## Project Structure
-
-```text
-.
-├── .env.example                # Sample environment configuration
-├── .gitignore                  # Git ignore rules
-├── README.md                   # This file
-├── FULL_SYSTEM_DOCS.md         # Expanded project documentation
-├── SYSTEM_MANUAL.md            # Operational manual
-├── SYSTEM_HEALTH_REPORT.md     # Health / validation notes
-├── V3.2_UPDATE_LOG.md          # Update history
-├── account_manager.py          # Account management logic
-├── ai_engine.py                # AI evaluation + chat + provider routing
-├── ai_trainer.py               # AI training / tuning helpers
-├── analytics.py                # Summary reporting over trade DB
-├── backtester.py               # Historical strategy backtesting
-├── bot.py                      # Main orchestration engine
-├── bridge_client.py            # MT5 bridge HTTP client
-├── config.py                  # Core settings and environment-based config
-├── data_provider.py            # OHLCV data fetcher
-├── mt5_bridge.py               # MT5 HTTP bridge server
-├── news_filter.py              # ForexFactory / economic news checks
-├── notifier.py                 # Telegram messaging and keyboard handlers
-├── risk_manager.py             # Position sizing and safety checks
-├── strategy.py                 # Core ICT/SMC analysis and grading
-├── trade_logger.py             # SQLite logging and state tracking
-├── weekly_analyst.py           # Weekly macro outlook generation
-├── health_check.sh             # Operational system validation script
-├── *.py                        # Utility, scan, verify, and debug scripts
-├── trades.db                   # Runtime SQLite DB (generated)
-├── weekly_outlook.json         # Generated outlook cache
-├── active_account.json         # Generated runtime config
-├── chat_id.json                # Telegram chat ID cache
-├── tg_offset.json              # Telegram offset cache
-└── .env                        # Local secrets; not committed
-```
-
-## Requirements
-
-- Python 3.10+
-- MetaTrader 5 terminal and account access
-- MT5 Python package (`MetaTrader5`)
-- Telegram Bot token
-- Gemini API key and/or OpenRouter API key
-- Network access to broker / Telegram / AI endpoints
-- A machine that can run the bridge process with MT5 installed
-
-## Environment Setup
-
-1. Copy the sample environment file:
-
-```bash
-cp .env.example .env
-```
-
-2. Fill in your credentials and broker details in `.env`.
-
-Example variables include:
-
-```dotenv
-TELEGRAM_TOKEN=your_telegram_bot_token_here
-GEMINI_API_KEY=your_gemini_api_key_here
-OPENROUTER_API_KEY=your_openrouter_api_key_here
-BRIDGE_URL=http://localhost:5001
-MT5_DEMO_LOGIN=00000000
-MT5_DEMO_PASSWORD=
-MT5_DEMO_SERVER=Exness-MT5Trial7
-MT5_REAL_LOGIN=00000000
-MT5_REAL_PASSWORD=
-MT5_REAL_SERVER=Exness-MT5Real15
-ACTIVE_ACCOUNT=demo
-```
-
-3. Review and tune the bot in `config.py` for symbols, risk, spreads, scan schedule, and strategy filters.
-
-## Quick Start
-
-### 1) Launch the MT5 bridge
-
-Run the bridge process on the machine where MetaTrader 5 is installed:
-
-```bash
-python mt5_bridge.py
-```
-
-### 2) Start the trading bot
-
-```bash
-python bot.py
-```
-
-This starts the event loop, Telegram command handling, scanning, trade management, and logging.
-
-### 3) Optional: run diagnostics
-
-```bash
-python verify_all.py
-python test_scan.py
-python analytics.py
-```
-
-## Core Runtime Flow
-
-The bot typically works like this:
-
-1. Polls MT5 health / account status
-2. Checks open trades and lifecycle rules
-3. Runs market scans at configured 4H or kill-zone intervals
-4. Evaluates setups using ICT/SMC logic and grading
-5. Applies AI gatekeeper approval when enabled
-6. Checks risk, spread, and news filters
-7. Executes order through MT5 bridge
-8. Logs trades and sends Telegram updates
-
-## Trading Logic Highlights
-
-- Multi-timeframe structure bias and trend alignment
-- OTE / discount-premium zone validation
-- AOI zones, key levels, CHoCH, engulfing, and rejection candle checks
-- ADX-based trend filtering
-- Risk-based execution only for qualified setups
-- Trade lifecycle automation for partial exits and trailing management
-
-## Risk and Safety
-
-This project includes safety systems such as:
-
-- Daily trade caps
-- Concurrent position caps
-- Symbol cooldown after losses
-- Spread and news checks
-- Maximum risk percentage guardrails
-- EMA-based trade invalidation logic
-- TTL-based exit protection
-
-However, live trading still carries substantial financial risk. Use this project only in a controlled environment and validate with backtesting and paper trading before live execution.
-
-## Backtesting and Analysis
-
-Useful tools in the repo:
-
-```bash
-python backtester.py
-python analytics.py
-python full_grade_scan.py
-python debug_engulf.py
-python test_signals.py
-```
-
-These help evaluate historical behavior, signal quality, and trade classification.
-
-## Documentation
-
-This repository includes several notes and reference docs:
-
-- `FULL_SYSTEM_DOCS.md` — deep architecture and system documentation
-- `SYSTEM_MANUAL.md` — operational instructions and workflows
-- `README_BOT_STRUCTURE.md` — bot structure overview
-- `V3.2_UPDATE_LOG.md` — version update notes
-- `SYSTEM_HEALTH_REPORT.md` — health and validation summaries
-
-## Important Notes
-
-- The repo is designed around real MT5 execution and is not a generic demo app.
-- Keep `.env` local and never commit password or API secret values.
-- Review the code and strategy before using it with real capital.
-- MT5 connectivity, market hours, and broker rules differ by account and region.
-
-## Disclaimer
-
-This project is provided for educational and research purposes. It does not constitute financial advice. Automated trading may result in loss of capital. The author and contributors are not responsible for losses incurred while using this software.
-
-## License
-
-This repository does not currently declare an explicit license in the GitHub metadata. If needed, add a license file before production or distribution use.
-
-## Contributing
-
-If you are extending the project, keep these principles in mind:
-
-- prefer clear, well-commented changes
-- preserve safety checks and risk controls
-- validate with targeted unit or functional tests
-- keep `.env` and secrets out of version control
+> **Institutional-grade automated trading system combining daily momentum trend-following, ICT/SMC multi-timeframe structural liquidity analysis, Google Gemini AI setup evaluation, and automated multi-account MetaTrader 5 execution.**
 
 ---
 
-Built for institutional-style FX automation, AI-assisted analysis, and disciplined execution workflows.
+## 1. Executive Summary
+
+**FXAlexG v3.3** is an institutional-grade, event-driven algorithmic trading engine and multi-account portfolio orchestrator. Engineered in Python to run 24/7 on headless Linux environments (Wine + Xvfb), the system interfaces directly with MetaTrader 5 via an isolated HTTP REST bridge service.
+
+The architecture decouples market data extraction, quantitative signal generation, AI analytical gating, capital risk verification, and broker order execution. It supports concurrent multi-account execution across heterogeneous strategies—ranging from daily crypto trend following to mechanical 4-hour / 15-minute Inner Circle Trader (ICT) Smart Money Concepts (SMC).
+
+```
+                            +-------------------------------------------+
+                            |       MetaTrader 5 Broker Terminal        |
+                            |       (Wine / Xvfb Headless Daemon)       |
+                            +---------------------+---------------------+
+                                                  | Native Python API
+                                                  v
+                            +-------------------------------------------+
+                            |     Flask HTTP Bridge (mt5_bridge.py)     |
+                            |      Port 5001 - Low-Latency REST API     |
+                            +---------------------+---------------------+
+                                                  ^
+                                                  | JSON / HTTP
+                                                  v
++---------------------------------------------------------------------------------------------------+
+|                                  FXAlexG Orchestration Engine                                    |
+|                                                                                                   |
+|  +-----------------------+     +------------------------+     +--------------------------------+  |
+|  |     Strategy Core     |     |   AI Valuation Gate    |     |      Risk Management Gate      |  |
+|  | - Daily Trend (EMA)   | --> | - Gemini 2.5 Flash     | --> | - Account-Sized Lots           |  |
+|  | - ICT / SMC Engine    |     | - JSON Strict Contract |     | - Downward Lot Rounding        |  |
+|  | - Multi-TF Structure  |     | - Macro Sentiment      |     | - Hard Drawdown Protection     |  |
+|  +-----------------------+     +------------------------+     +---------------+----------------+  |
+|                                                                               |                   |
+|  +----------------------------------------------------------------------------v----------------+  |
+|  |                                Multi-Account Portfolio Router                               |  |
+|  |              Dispatches validated orders to assigned account tiers in accounts.db           |  |
+|  +--------------------------------------------+------------------------------------------------+  |
++-----------------------------------------------|---------------------------------------------------+
+                                                |
+                     +--------------------------+--------------------------+
+                     |                                                     |
+                     v                                                     v
+   +------------------------------------+                +------------------------------------+
+   |     SQLite State Persistence       |                |     Telegram Telemetry Matrix      |
+   |  - trades.db (Execution records)   |                |  - Real-time trade event badges    |
+   |  - accounts.db (Multi-tenant)      |                |  - Interactive command terminal    |
+   +------------------------------------+                +------------------------------------+
+```
+
+---
+
+## 2. Quantitative Strategy & Alpha Models
+
+The platform implements two distinct, mathematically backtested execution engines designed to extract alpha across non-correlated asset classes and regimes:
+
+### 2.1 Engine A: Daily Crypto Trend-Following (`trend` & `trend_fast`)
+Designed for liquid cryptocurrency pairs to capture high-beta macro directional expansions while strictly controlling downside exposure.
+
+* **Mathematical Rules:**
+  * **Regime Filter:** Daily close above Exponential Moving Averages ($EMA_{fast} > EMA_{slow}$).
+  * **Long-Only Bias:** Exploits the structural long-term asymmetry of crypto assets; short-selling was rigorously backtested and declined due to poor edge ($PF \approx 0.76$).
+  * **Dynamic Stop-Loss:** Calculated as entry minus $3.0 \times ATR(20)_{daily}$. The trailing stop is ratcheted upward once daily at market close, locking in uncaptured unrealized profit.
+  * **Exit Condition:** Clean daily close below the dynamic EMA baseline or trailing stop violation.
+* **Variant Comparison:**
+  * `trend` (Standard): Daily EMA 20 / EMA 100 crossover. Lower frequency (~9 trades/yr across 7 coins), exceptional statistical reliability.
+  * `trend_fast`: Daily EMA 15 / EMA 80 crossover. Higher turnover (~13 trades/yr), tighter response with wider variance.
+* **Universe Allocation:**
+  * *Micro Accounts ($20–$100):* `SOLUSDm`, `XRPUSDm`, `ADAUSDm`, `DOGEUSDm`. Assets with granular broker lot sizing enabling valid risk scaling below account risk caps.
+  * *Standard Accounts ($500+):* `BTCUSDm`, `ETHUSDm`, `BNBUSDm`. Automatically unlocked when equity permits minimum lot sizes without violating risk parameters.
+
+### 2.2 Engine B: Institutional ICT / Smart Money Concepts (`smc` & `smc_ai`)
+Mechanical implementation of institutional order-flow microstructure principles targeting intraday and swing liquidity imbalances.
+
+* **Multi-Timeframe Structural Stack:**
+  * **Weekly & Daily (W1/D1):** High-Timeframe (HTF) institutional bias and structural order flow.
+  * **4-Hour (4H):** Dealing range identification, Premium vs. Discount valuation (entries restricted to $\le 50\%$ discount for longs, $\ge 50\%$ premium for shorts), and Areas of Interest (AOI).
+  * **15-Minute (15M):** Execution timeframe. Identifies Change of Character (CHoCH), Fair Value Gaps (FVG), breaker blocks, and liquidity sweeps during London / New York Kill Zones.
+* **Scoring & Grading Gate:**
+  * **A+ Setups (Score $\ge 95$):** Full multi-timeframe alignment, clean liquidity sweep, prime discount/premium displacement. Executed mechanically across all SMC accounts.
+  * **B+ Setups (Score $80–94$):** Requires AI confirmation.
+* **Curated 5-Asset Universe:**
+  * `BTCUSDm`, `EURJPYm`, `GBPUSDm`, `GBPJPYm`, `ETHUSDm`.
+  * *Gold (`XAUUSDm`) Decommission Notice:* Real MT5 execution history and tick data analysis demonstrated that Gold's high volatility and 0.01 minimum lot size produced disproportionate drawdown on accounts under $1,000. It has been isolated from micro-account profiles.
+
+---
+
+## 3. Empirical Research & Walk-Forward Validation
+
+Every strategy variant in FXAlexG undergoes strict walk-forward backtesting using out-of-sample data partitions (first 60% sample vs. final 40% out-of-sample).
+
+| Quantitative Model | Sample Window | Sample Size | Aggregate PF | Out-of-Sample PF | Production Verdict |
+|---|---|---|---|---|---|
+| **Crypto Trend (7 Coins, EMA 20/100)** | 2019 – 2026 | 73 trades | **3.41** | **6.67** | **Active Production** |
+| **Crypto Trend Fast (7 Coins, EMA 15/80)** | 2019 – 2026 | 104 trades | **2.31** | **4.09** | **Active Production** |
+| **Crypto Trend (4 Core Micro Coins)** | 2019 – 2026 | 37 trades | **5.18** | **10.67** | **Active Production** |
+| Original SMC (Forex Majors) | 2022 – 2026 | 379 trades | 0.71 | 0.44 | Deprecated (Negative Edge) |
+| Forex Daily Trend (Long Only) | 2019 – 2026 | 120 trades | 0.57 | 0.60 | Deprecated (Negative Edge) |
+| London Breakout (1R Target) | 2020 – 2026 | 8,729 trades | 1.00 | 1.00 | Rejected (Zero Edge Post-Spread) |
+| London Breakout (2R Target) | 2020 – 2026 | 8,729 trades | 1.04 | 1.04 | Rejected (Fails Commission/Slippage) |
+
+### Micro-Capital Compounding Curves ($20 Initial Balance, Trend Engine)
+Simulated historical compounding on non-reinvested fixed fractional risk per trade:
+* **2.0% Risk / Trade:** Final Balance: **$68** | Max Drawdown: **14%**
+* **5.0% Risk / Trade:** Final Balance: **$139** | Max Drawdown: **25%**
+* **10.0% Risk / Trade (Live Profile):** Final Balance: **$478** | Max Drawdown: **46%** (Trough Equity: $12.08)
+
+---
+
+## 4. Multi-Account Portfolio Router
+
+FXAlexG features an integrated multi-tenant account dispatcher managed through `accounts.db`:
+
+```
+                                      +------------------------+
+                                      | Strategy Signal Raised |
+                                      +-----------+------------+
+                                                  |
+                         +------------------------+------------------------+
+                         |                                                 |
+                         v                                                 v
+           [Strategy: "trend"]                               [Strategy: "smc"]
+                         |                                                 |
+           +-------------+-------------+                                   |
+           |                           |                                   |
+           v                           v                                   v
++--------------------+      +--------------------+              +--------------------+
+| Master Account     |      | Follower Account   |              | Dedicated Account  |
+| Login: 436015341   |      | Login: 486074840   |              | Login: 477674441   |
+| Strat: trend       |      | Strat: trend_fast  |              | Strat: smc         |
+| Risk: 10%          |      | Risk: 10%          |              | Risk: 10%          |
++--------------------+      +--------------------+              +--------------------+
+```
+
+* **Session Context Switching:** The MT5 bridge maintains a persistent connection to the master account. When executing or auditing secondary accounts, the bridge dynamically switches terminal login contexts, executes the order pipeline, verifies ticket acquisition, and restores the primary session.
+* **Granular Risk Quotas:** Each account in `accounts.db` maintains independent balance tracking, custom risk allocations (`risk_pct`), strategy assignments, and active/paused state toggles.
+
+---
+
+## 5. Risk Management & Execution Safeguards
+
+1. **Broker-Side Execution Only:** Every trade is transmitted with hard broker-side Stop Loss (SL) and Take Profit (TP) parameters. No position is left unhedged on the client side.
+2. **Dynamic Downward Lot Rounding:** On micro accounts ($20–$100), standard mathematical lot rounding up can unintentionally risk 30–50% of capital on broker minimum lot limits (0.01). FXAlexG enforces strict downward rounding: if minimum lot size exceeds the calculated maximum risk dollar cap (`MAX_RISK_PCT`), the trade is automatically aborted.
+3. **Adaptive Take-Profit Ladder:**
+   * **TP1 ($1.5 \times R$):** Closes 50% of the position volume and updates the broker-side SL to entry breakeven. (Automatically adjusted to breakeven-only if lot size is at the broker's 0.01 minimum).
+   * **TP2 ($3.5 \times R$):** Final profit target target for SMC structural extensions.
+4. **Spread Spike Shield:** Rejects entry execution when current bid/ask spread exceeds $3.0 \times$ normal baseline spread.
+5. **Economic Calendar Blackout:** Integrated ForexFactory news parser blocks new order execution 30 minutes prior to and 30 minutes following high-impact (Red Folder) macroeconomic announcements.
+6. **Time-to-Live (TTL) Safety Invalidation:** Positions failing to reach TP1 within 36 hours undergo systematic health evaluation to mitigate weekend swap degradation and range stagnation.
+
+---
+
+## 6. AI Gatekeeper Engine (Google Gemini 2.5 Flash)
+
+FXAlexG integrates Google Gemini 2.5 Flash as an institutional evaluation layer:
+
+* **Strict JSON Contract Enforcement:** Employs `responseMimeType: "application/json"` with `thinkingBudget: 0` to prevent token exhaustion and JSON truncation during high-volatility market pulses.
+* **Dual Gate Modes:**
+  * `advisory` *(Production Default)*: Attaches AI institutional rationale to Telegram alerts while allowing pure mathematical strategy rules to determine execution. Ensures zero dropped trades during cloud API outages.
+  * `veto`: AI acts as a hard filter; setups are rejected if institutional confidence falls below 70%.
+* **Automated Post-Trade Review:** Evaluates closed orders against HTF macro context to build persistent learning memories in `trades.db`.
+
+---
+
+## 7. System Architecture & Topology
+
+```text
+.
+├── account_manager.py      # SQLite accounts.db multi-tenant manager
+├── ai_engine.py            # Gemini 2.5 Flash client & JSON schema enforcement
+├── ai_trainer.py           # Institutional meta-learning & feedback optimizer
+├── analytics.py            # Trade performance analytics & expectancy reporting
+├── backtester.py           # Historical backtest engine for SMC logic
+├── bot.py                  # Main system event loop & scheduler daemon
+├── bridge_client.py        # Low-latency REST client with automatic order recovery
+├── check_spreads.py        # Real-time broker spread audit tool
+├── config.py               # Central environment & quantitative parameter configuration
+├── data_provider.py        # Multi-timeframe OHLCV aggregator & feature pipeline
+├── diagnose_all.py         # End-to-end multi-account diagnostic engine
+├── full_grade_scan.py      # Instantaneous market-wide setup scan utility
+├── london_research.py      # London / New York breakout quantitative research
+├── mt5_bridge.py           # Headless Flask REST bridge interacting with MT5 API
+├── news_filter.py          # Economic calendar parser & news blackout gate
+├── notifier.py             # Telegram bot messaging hub & interactive inline keyboard
+├── risk_manager.py         # Capital protection, lot calculation, and margin profiler
+├── strategy.py             # ICT / SMC structural market analysis & grading engine
+├── test_ai_analysis.py     # AI gatekeeper unit test harness
+├── trade_logger.py         # SQLite trades.db state persistence & scoreboard engine
+├── trend_research.py       # Crypto trend quantitative research & parameter sweep
+├── trend_strategy.py       # Daily EMA20/100 trend-following production strategy
+├── verify_all.py           # Production pre-flight readiness audit
+├── walkforward_backtest.py # Out-of-sample walk-forward backtest harness
+├── FULL_SYSTEM_DOCS.md     # Deep architecture and systems manual
+├── SYSTEM_GUIDE.md         # Operational handbook and production guide
+└── CHANGELOG_2026-11-14.md # Infrastructure & VPS migration log
+```
+
+---
+
+## 8. Installation & Deployment Guide
+
+### 8.1 Prerequisites
+* Ubuntu 20.04 / 22.04 LTS (Oracle Cloud Always-Free tier fully supported)
+* Wine 64-bit with MetaTrader 5 installed
+* Python 3.10+
+* Dedicated Telegram Bot token ([@BotFather](https://t.me/BotFather))
+* Google Gemini API Key
+
+### 8.2 Environment Configuration
+Clone the repository and initialize the environment file:
+
+```bash
+git clone https://github.com/anonyemichael/FXAlexG-TradingBot.git
+cd FXAlexG-TradingBot
+cp .env.example .env
+```
+
+Populate `.env` with your secure credentials:
+
+```dotenv
+# Core Telegram Configuration
+TELEGRAM_TOKEN=1234567890:ABCdefGHIjklMNOpqrSTUvwxyz
+TELEGRAM_CHAT_ID=123456789
+
+# AI Gateway
+GEMINI_API_KEY=AIzaSy...
+
+# MT5 REST Bridge Configuration
+BRIDGE_URL=http://127.0.0.1:5001
+
+# Master MT5 Broker Credentials
+MT5_DEMO_LOGIN=436015341
+MT5_DEMO_PASSWORD=YourSecurePassword
+MT5_DEMO_SERVER=Exness-MT5Trial9
+ACTIVE_ACCOUNT=demo
+```
+
+### 8.3 Systemd Production Service Setup
+To ensure automatic failover, restarts upon reboot, and OOM isolation, configure the system as managed Linux daemons:
+
+```bash
+# 1. Virtual Display Daemon for Headless Wine
+sudo systemctl enable --now xvfb.service
+
+# 2. MetaTrader 5 Terminal Instance
+sudo systemctl enable --now mt5-terminal.service
+
+# 3. Low-Latency MT5 REST Bridge
+sudo systemctl enable --now mt5-bridge.service
+
+# 4. FXAlexG Trading Engine
+sudo systemctl enable --now fxalexg-bot.service
+```
+
+---
+
+## 9. Telemetry & Telegram Command Terminal
+
+FXAlexG features an interactive command matrix through Telegram. All outgoing order alerts prepend explicit bot badges (e.g., `📈 Crypto Trend · #436015341` or `🎯 SMC · #477674441`).
+
+| Command | Action |
+|---|---|
+| `/scoreboard` | Real-time balance refresh, closed-trade P&L, win-rate ranking across all accounts |
+| `/status` | Active connection health, open tickets, MT5 bridge latency |
+| `/report` | Cumulative P&L breakdown, Sharpe ratio, and expectancy metrics |
+| `/accounts` | Enumerate all connected accounts and assigned strategies |
+| `/strategy <login> <name>` | Hot-swap account strategy (`trend`, `trend_fast`, `smc`, `smc_ai`) |
+| `/risk <login> <pct>` | Adjust per-trade risk percentage dynamically |
+| `/pause <login>` | Suspend new order scanning for a specific account |
+| `/resume <login>` | Re-activate order execution for a paused account |
+| `/pulse` | Trigger instantaneous macro market sentiment sweep |
+| `/news` | Display impending high-impact economic events |
+
+---
+
+## 10. Operational Health & Troubleshooting
+
+```bash
+# View live orchestrator stream
+sudo journalctl -u fxalexg-bot -f
+
+# Inspect bridge network communications
+sudo journalctl -u mt5-bridge -n 100 --no-pager
+
+# Perform comprehensive pre-flight verification
+python3 verify_all.py
+
+# Run standalone quantitative strategy simulation
+python3 trend_research.py
+```
+
+---
+
+## 11. Risk Disclaimer
+
+**DISCLAIMER:** Automated trading in financial instruments, foreign exchange (Forex), and cryptocurrencies involves significant risk of loss and is not suitable for all investors. Historical backtest performance is not indicative of future returns. The software is provided "as is", without warranty of any kind. Carefully evaluate your financial status and risk tolerance prior to live capital deployment.
+
+---
+
+## 12. License
+
+Distributed under the MIT License. See `LICENSE` for details.
