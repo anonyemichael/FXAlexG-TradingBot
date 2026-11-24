@@ -24,6 +24,7 @@ On a slow AI or bridge the bot retries instead of dropping a trade, and never se
 ## 3. Methods and accounts
 | Method | Rules | Markets | Trades |
 |---|---|---|---|
+| `momentum` (recommended) | Only while BTC daily close > EMA100. 4H: buy a close above the 42-candle high, 2.5×ATR trailing stop. Daily: buy a close above the 20-day high, 3×ATR trailing stop (closed if BTC filter turns off). Long only, max 4 open, ≤8% risk per trade. Validated on 79 unseen coins (daily PF 2.16) and 34 unseen coins (4H PF 1.33). See MOMENTUM_RESEARCH.md. | SOL, XRP, DOGE, ADA, BNB, ETH, BTC | ~1/week on $10 when BTC filter is on; none while it is off |
 | `trend` | Buy when daily EMA20 crosses above EMA100. Stop 3×ATR(20), raised daily. Exit when EMA20 closes below EMA100. Long only, no fixed target. | SOL, XRP, ADA, DOGE, BNB, BTC, ETH (BNB/BTC/ETH skipped on ~$20 accounts: min lot too big) | ~9/year total |
 | `trend_fast` | Same rules with EMA15/80 (7-coin backtest PF 2.31, both halves profitable; deeper drawdowns). | Same 7 coins | ~13/year total |
 | `swing4h` | Buy when a 4H candle closes above the last 42 candles' high. Stop 2×ATR(20), trailed every 4H. No fixed target. Long only. Unproven: PF 1.55 on 8 big coins, 1.14 on 34 others. Demo first. | SOL, XRP, ADA, DOGE, BNB, BTC, ETH (~$10 fits SOL/XRP/ADA/DOGE only) | ~3.8/week (≈1.7/week on $10) |
@@ -72,6 +73,9 @@ Original bot: 12 trades Oct 18–30, 2 real wins, about −$15.60 net; then 0 tr
 | FXAlexG Set & Forget, 8 crypto 4H | 333 | 0.98 | – | – | Fail |
 | Crypto 4H 42-candle breakout, trailing (8 coins, 2024–26) | 498 | 1.55 | 1.25 | 1.84 | Pass in-sample |
 | Same rules on 34 other coins (out-of-sample) | 1,768 | 1.14 | 0.97 | 1.30 | Weak → demo first |
+| Momentum daily engine (BTC filter), 79 unseen coins 2018–26 | 1,405 | 2.16 | 2.78 | 1.63 | Pass |
+| Momentum 4H engine (BTC filter), 34 unseen coins 2024–26 | 1,040 | 1.33 | 1.17 | 1.50 | Pass |
+| Grid / DCA bots, conservative fills | – | <1 | – | – | Fail |
 
 Crypto trend held for all 12 nearby settings. A 4H version failed. SOL gave much of the profit; only one signal since Jan 2025.
 Forex can't run on $20: one 3×ATR stop at the 0.01 minimum lot ≈ $15 on EURUSD (75% of $20), ≈ $190 on gold.
@@ -115,7 +119,7 @@ Every trade message starts with the bot that took it: **📈 Crypto Trend · #lo
 (opened, skipped, rejected, TP1, closed with ✅ WIN / ❌ LOSS). SMC scan summaries are labelled **🎯 SMC scanner**.
 **🏆 Scoreboard** button / `/scoreboard`: refreshes every account's balance and ranks the bots by closed-trade P&L, win rate, open trades.
 `/start` menu · `/status` balance · `/report` P&L · `/accounts` list · `/connect` add account ·
-`/strategy [login] [trend|trend_fast|swing4h|alexg|smc|smc_ai]` · `/risk [login] [pct]` · `/pause [login]` · `/resume [login]` · `/remove [login]` ·
+`/strategy [login] [momentum|trend|trend_fast|swing4h|alexg|smc|smc_ai]` · `/risk [login] [pct]` · `/pause [login]` · `/resume [login]` · `/remove [login]` ·
 `/news` · `/ai [pair]` · `/pulse` · any other text = AI chat.
 
 ## 8. Operations (VPS: `ssh trading-bot`)

@@ -31,6 +31,7 @@ import account_manager
 import trend_strategy
 import swing_strategy
 import alexg_strategy
+import momentum_strategy
 
 ACCOUNT_WIZARDS = {}  # {chat_id: {"step": "...", "server": "...", "login": 123, ...}}
 
@@ -203,6 +204,8 @@ def manage_open_positions(login=None, is_master=True):
             continue  # 4H swing trades: stop trailed every 4H by manage_swing_positions()
         if trade.get("trigger") == alexg_strategy.TRIGGER:
             continue  # Set & Forget: broker-side SL/TP only, no partials / TTL / trailing
+        if trade.get("trigger") in momentum_strategy.TRIGGERS:
+            continue  # momentum trades: trailed / exited by manage_momentum_positions()
 
         entry     = trade["entry"]
         tp1       = trade.get("tp1")
@@ -340,7 +343,8 @@ def _revalidate_at_market(setup):
     live = bridge.get_price(setup["symbol"])
     if live is None:
         return True  # can't check; keep the candle-based plan
-    if setup.get("trigger") in trend_strategy.TRIGGERS or setup.get("trigger") in swing_strategy.TRIGGERS:
+    if setup.get("trigger") in trend_strategy.TRIGGERS or setup.get("trigger") in swing_strategy.TRIGGERS \
+            or setup.get("trigger") in momentum_strategy.TRIGGERS:
         # Trend / swing trades have no TP; the stop is a fixed ATR distance from the actual fill.
         setup["entry"] = live
         setup["sl"] = round(live - setup["sl_dist"], 6)
@@ -371,6 +375,13 @@ def _revalidate_at_market(setup):
     return True
 
 
+def _method_risk_cap(setup):
+    """Tighter per-method risk cap (None = global MAX_RISK_PCT)."""
+    if setup.get("trigger") in momentum_strategy.TRIGGERS:
+        return getattr(config, "MOMENTUM_MAX_RISK_PCT", None)
+    return None
+
+
 def _dispatch_setup_to_accounts(setup, side, grade, score, has_news=False, methods=("trend",), kill_zone=None):
     """
     Executes a signal on every active account whose assigned strategy is in `methods`.
@@ -387,7 +398,8 @@ def _dispatch_setup_to_accounts(setup, side, grade, score, has_news=False, metho
     if not active_accounts:
         acc = bridge.get_account()
         bal = acc.get("balance", 0.0) if acc else 0.0
-        lot, risk_usd, risk_pct, warn = risk_manager.calculate_lot_size(symbol, setup["sl_dist"], bal)
+        lot, risk_usd, risk_pct, warn = risk_manager.calculate_lot_size(
+            symbol, setup["sl_dist"], bal, max_risk_pct=_method_risk_cap(setup))
         if not lot or lot <= 0:
             print(f"[{_ts()}] {symbol}: setup skipped by risk manager: {warn}")
             notifier.send(f"🚫 <b>{symbol} setup skipped</b> — {warn}")
@@ -445,10 +457,12 @@ def _dispatch_setup_to_accounts(setup, side, grade, score, has_news=False, metho
                 max_open = getattr(config, "SWING_MAX_OPEN", 3)
             elif trig == alexg_strategy.TRIGGER:
                 max_open = getattr(config, "ALEXG_MAX_OPEN", 3)
+            elif trig in momentum_strategy.TRIGGERS:
+                max_open = getattr(config, "MOMENTUM_MAX_OPEN", 4)
             else:
                 max_open = config.MAX_CONCURRENT
             is_smc = trig not in trend_strategy.TRIGGERS and trig not in swing_strategy.TRIGGERS \
-                and trig != alexg_strategy.TRIGGER
+                and trig != alexg_strategy.TRIGGER and trig not in momentum_strategy.TRIGGERS
             if len(acc_pos) >= max_open:
                 print(f"[{_ts()}] Multi-Account: #{login} has {len(acc_pos)} open (max {max_open}) — skipped.")
                 continue
@@ -462,7 +476,7 @@ def _dispatch_setup_to_accounts(setup, side, grade, score, has_news=False, metho
 
             # 2. Dynamic lot sizing strictly adhering to this account's equity and risk %
             lot, risk_usd, actual_pct, warn = risk_manager.calculate_lot_size(
-                symbol, setup["sl_dist"], bal, risk_pct=r_pct
+                symbol, setup["sl_dist"], bal, risk_pct=r_pct, max_risk_pct=_method_risk_cap(setup)
             )
             if not lot or lot <= 0:
                 print(f"[{_ts()}] Multi-Account: #{login} (${bal:.2f}) skipped: {warn}")
@@ -554,6 +568,7 @@ def manage_other_accounts():
             manage_open_positions(login, is_master=False)   # SMC: TP1 / breakeven / trailing / TTL
             manage_trend_positions(login, is_master=False)  # trend: chandelier stop / EMA exit
             manage_swing_positions(login, is_master=False)  # 4H swing: chandelier stop
+            manage_momentum_positions(login, is_master=False)  # momentum: trail / market-filter exit
     finally:
         if switched:
             _restore_master()
@@ -707,6 +722,116 @@ def run_alexg_scan():
         except Exception as e:
             print(f"[{_ts()}] S&F scan error on {symbol}: {e}")
             traceback.print_exc()
+
+
+_mom_scanned = set()      # {(engine, symbol, candle_time)}
+_mom_regime_cache = {"t": 0.0, "on": None}
+
+
+def _momentum_regime():
+    """Market filter: BTC daily close above its EMA. Cached for 10 minutes. None if BTC data is unavailable."""
+    if time.time() - _mom_regime_cache["t"] < 600 and _mom_regime_cache["on"] is not None:
+        return _mom_regime_cache["on"]
+    sym = getattr(config, "MOMENTUM_REGIME_SYMBOL", "BTCUSDm")
+    df = dp.get_daily(sym, count=300)
+    if df is None or len(df) < 120:
+        return None
+    on = momentum_strategy.regime_ok(df)
+    if _mom_regime_cache["on"] is not None and on != _mom_regime_cache["on"]:
+        notifier.send(f"🛰️ <b>Momentum market filter {'ON' if on else 'OFF'}</b> — BTC closed "
+                      f"{'above' if on else 'below'} its {momentum_strategy.REGIME_EMA}-day EMA. "
+                      f"{'New breakouts will be traded.' if on else 'No new buys; daily-engine trades are closed.'}")
+    _mom_regime_cache.update(t=time.time(), on=on)
+    return on
+
+
+def _expected_candle(engine):
+    hrs = momentum_strategy.ENGINES[engine]["tf_hours"]
+    now = pd.Timestamp(datetime.now(timezone.utc))
+    return str(now.floor(f"{hrs}h" if hrs < 24 else "1D") - pd.Timedelta(hours=hrs))
+
+
+def _momentum_bars(symbol, engine):
+    return dp.get_4h(symbol, count=300) if engine == "mom_4h" else dp.get_daily(symbol, count=300)
+
+
+def run_momentum_scan():
+    """Momentum Breakout entries (accounts assigned 'momentum'). Each engine/symbol is evaluated once per
+    closed candle; nothing is downloaded again until the next candle is due."""
+    if not bridge.get_account():
+        print(f"[{_ts()}] MT5 bridge offline — momentum scan skipped.")
+        return
+    on = _momentum_regime()
+    if on is None:
+        print(f"[{_ts()}] Momentum: BTC daily data unavailable — scan skipped.")
+        return
+    for engine in getattr(config, "MOMENTUM_ENGINES", ["mom_4h", "mom_d1"]):
+        expected = _expected_candle(engine)
+        for symbol in getattr(config, "MOMENTUM_SYMBOLS", []):
+            if (engine, symbol, expected) in _mom_scanned:
+                continue
+            if not on:
+                _mom_scanned.add((engine, symbol, expected))
+                continue
+            df = _momentum_bars(symbol, engine)
+            if df is None or len(df) < 80:
+                continue
+            closed = momentum_strategy.closed_bars(df, momentum_strategy.ENGINES[engine]["tf_hours"])
+            if closed is None or closed.empty:
+                continue
+            _mom_scanned.add((engine, symbol, str(closed.index[-1])))
+            setup = momentum_strategy.entry_signal(symbol, df, engine, on)
+            label = momentum_strategy.ENGINES[engine]["label"]
+            if not setup:
+                continue
+            if not _spread_vs_stop_ok(symbol, setup["sl_dist"], getattr(config, "MOMENTUM_MAX_SPREAD_FRAC", 0.15)):
+                print(f"[{_ts()}] Momentum {label} {symbol}: spread too wide for the stop. Skipping.")
+                continue
+            print(f"[{_ts()}] Momentum {label} {symbol}: breakout — buying.")
+            _dispatch_setup_to_accounts(setup, "buy", setup["grade"], setup["score"], methods=("momentum",))
+    if not on:
+        print(f"[{_ts()}] Momentum: market filter OFF (BTC below EMA{momentum_strategy.REGIME_EMA}) — no new buys.")
+
+
+def manage_momentum_positions(login=None, is_master=True):
+    """Trails momentum stops (never lowers them) and closes daily-engine trades when the market filter turns off."""
+    if login is None:
+        login = _master_login()
+    open_tickets = trade_logger.get_open_trade_tickets(login, is_master)
+    if not open_tickets:
+        return
+    live_positions = bridge.get_positions()
+    if not live_positions:
+        return
+    live_by_ticket = {p["ticket"]: p for p in live_positions}
+    on = None
+    for ticket in open_tickets:
+        trade = trade_logger.get_trade_by_ticket(ticket)
+        pos = live_by_ticket.get(ticket)
+        engine = trade.get("trigger") if trade else None
+        if not trade or not pos or engine not in momentum_strategy.TRIGGERS:
+            continue
+        if on is None:
+            on = _momentum_regime()
+            if on is None:
+                return  # no BTC data: don't exit anything blindly
+        symbol = trade["symbol"]
+        df = _momentum_bars(symbol, engine)
+        action, new_sl = momentum_strategy.manage(df, engine, trade["opened_at"], pos.get("sl", 0.0), on)
+        if action == "exit" and _action_failures.get((ticket, "mom_exit"), 0) < 5:
+            res = bridge.close_position(ticket)
+            if res and "error" not in res:
+                notifier.send(f"<b>{_tag(login)}</b>\n🛰️ <b>Closed {symbol} #{ticket}</b> — market filter off "
+                              f"(BTC below its {momentum_strategy.REGIME_EMA}-day EMA).")
+            else:
+                _action_failures[(ticket, "mom_exit")] = _action_failures.get((ticket, "mom_exit"), 0) + 1
+                print(f"[{_ts()}] Momentum exit failed for #{ticket}: {res}")
+        elif action == "trail":
+            res = bridge.modify_sl(ticket, round(new_sl, 6))
+            if res and "error" not in res:
+                print(f"[{_ts()}] Momentum {symbol} #{ticket}: stop raised to {new_sl:.6g}")
+            else:
+                print(f"[{_ts()}] Momentum {symbol} #{ticket}: stop raise failed: {res}")
 
 
 def run_scan(kill_zone=None):
@@ -1228,7 +1353,7 @@ def _handle_show_accounts(chat_id, user_id=None):
         )
     lines.append(
         "🏆 /scoreboard — who is winning\n"
-        "<code>/strategy [login] [trend|trend_fast|swing4h|alexg|smc|smc_ai]</code> · <code>/risk [login] [pct]</code>\n"
+        "<code>/strategy [login] [momentum|trend|trend_fast|swing4h|alexg|smc|smc_ai]</code> · <code>/risk [login] [pct]</code>\n"
         "<code>/pause [login]</code> · <code>/resume [login]</code> · <code>/remove [login]</code>"
     )
     notifier.send("\n".join(lines), chat_id=chat_id)
@@ -1566,7 +1691,7 @@ def main():
 
             # Which methods are in use is decided by the accounts (accounts.strategy).
             in_use = {(a.get("strategy") or "trend") for a in account_manager.get_active_accounts()} \
-                or {getattr(config, "STRATEGY", "trend")}
+                or {getattr(config, "STRATEGY", "momentum")}
 
             # Extra accounts: reconcile closes + manage stops every 5 minutes
             if time.time() - last_other_check >= 300:
@@ -1583,7 +1708,7 @@ def main():
                     run_trend_scan()
                     last_trend_slot = hour_slot
 
-            if in_use & {"swing4h", "alexg"}:
+            if in_use & {"swing4h", "alexg", "momentum"}:
                 # 4H methods: a few minutes after each 4H close (00/04/08/12/16/20 UTC), plus a retry
                 # every 30 min in case the bridge was busy (each symbol is evaluated once per candle).
                 h4_slot = (now.strftime("%Y-%m-%d"), h // 4, m // 30)
@@ -1594,6 +1719,9 @@ def main():
                         run_swing_scan()
                     if "alexg" in in_use:
                         run_alexg_scan()
+                    if "momentum" in in_use:
+                        manage_momentum_positions()
+                        run_momentum_scan()
 
             if in_use & {"smc", "smc_ai"}:
                 # Kill Zone & 4H Candle Close Scans

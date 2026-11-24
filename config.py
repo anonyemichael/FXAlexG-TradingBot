@@ -62,7 +62,7 @@ ACTIVE_ACCOUNT = os.getenv("ACTIVE_ACCOUNT", "demo")  # Default fallback; overwr
 #          Walk-forward tested 2019–2026: profitable in both halves and across all nearby settings;
 #          $20 @ 2% risk -> ~$68, max drawdown ~14% (trend_research.py).
 # "smc"  : the original ICT/SMC scanner — backtested NEGATIVE (profit factor 0.6–0.9). Not recommended.
-STRATEGY = "trend"
+STRATEGY = "momentum"   # fallback when accounts.db has no accounts; per-account: /strategy <login> momentum
 # Coins with a small enough minimum lot for a $20 account and spread < 1%.
 # (LTC excluded: 3.4% spread. Forex/gold/BTC/ETH: minimum lot risks 17–300% of $20 per daily ATR.)
 # BNB/BTC/ETH added 2026-11-03 for more trades (~9/yr instead of ~5; 7-coin backtest PF 3.41, both halves
@@ -72,6 +72,24 @@ TREND_MAX_OPEN = 4
 TREND_EMA_FAST = 20
 TREND_EMA_SLOW = 100
 TREND_STOP_ATR = 3.0
+
+# --- Crypto Momentum Breakout (momentum_strategy.py) — account method "momentum" (recommended) ---
+# Research (MOMENTUM_RESEARCH.md): BTC daily close > EMA100 market filter; 4H engine buys a close above the
+# 42-candle high (2.5xATR trailing stop), daily engine buys a close above the 20-day high (3xATR trail).
+# Daily engine 2018-2026: PF 5.4 design coins, 1.9 same coins 2023+, 2.2 on 79 unseen coins.
+# 4H engine 2024-2026: PF 1.6 core coins, 1.3 on 34 unseen coins. $10 on SOL/XRP/DOGE/ADA @5%, 4 open:
+# $47.67 after 2.5 years (lowest $5.54). Expect ~1 trade/week on $10, more as BTC/ETH/BNB become sizable.
+MOMENTUM_SYMBOLS       = ["SOLUSDm", "XRPUSDm", "DOGEUSDm", "ADAUSDm", "BNBUSDm", "ETHUSDm", "BTCUSDm"]
+MOMENTUM_REGIME_SYMBOL = "BTCUSDm"
+MOMENTUM_REGIME_EMA    = 100
+MOMENTUM_4H_BREAK      = 42
+MOMENTUM_4H_ATR        = 2.5
+MOMENTUM_D1_BREAK      = 20
+MOMENTUM_D1_ATR        = 3.0
+MOMENTUM_ENGINES       = ["mom_4h", "mom_d1"]
+MOMENTUM_MAX_OPEN      = 4
+MOMENTUM_MAX_RISK_PCT  = 8.0    # skip a trade if even the minimum lot would risk more than this
+MOMENTUM_MAX_SPREAD_FRAC = 0.15 # skip if the live spread is more than 15% of the stop distance
 
 # --- 4H crypto swing (swing_strategy.py) — account method "swing4h" ---
 # Buy when a 4H candle closes above the previous 42 candles' high (a break of last week's high), stop 2xATR(20),

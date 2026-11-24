@@ -39,7 +39,7 @@ def get_pip_size(symbol):
     return 0.0001
 
 
-def calculate_lot_size(symbol, sl_dist, balance, target_risk_usd=None, risk_pct=None):
+def calculate_lot_size(symbol, sl_dist, balance, target_risk_usd=None, risk_pct=None, max_risk_pct=None):
     """
     Calculates exact lot size so the dollar risk equals target_risk_usd (or risk_pct / RISK_PERCENT of balance).
     Enforces minimum risk floor of $3.50 on micro accounts so 1:3.0 RR yields $10.00+ on winning trades.
@@ -115,8 +115,10 @@ def calculate_lot_size(symbol, sl_dist, balance, target_risk_usd=None, risk_pct=
 
     warn = None
     # Institutional Capital Protection Guard: Enforce MAX_RISK_PCT and MAX_RISK_USD
-    if risk_pct > MAX_RISK_PCT or actual_risk_usd > MAX_RISK_USD:
-        max_allowed_dollar = min(MAX_RISK_USD, balance * (MAX_RISK_PCT / 100.0))
+    # (a method can pass a tighter cap, e.g. momentum trades never risk more than MOMENTUM_MAX_RISK_PCT)
+    cap_pct = MAX_RISK_PCT if max_risk_pct is None else min(MAX_RISK_PCT, max_risk_pct)
+    if risk_pct > cap_pct or actual_risk_usd > MAX_RISK_USD:
+        max_allowed_dollar = min(MAX_RISK_USD, balance * (cap_pct / 100.0))
         safe_raw_lot = max_allowed_dollar / max(loss_per_lot, 1e-6)
         # Round DOWN: rounding to nearest turned 0.0067 lot into 0.01 and let a 30% risk through a 20% cap.
         safe_lot = round(math.floor(safe_raw_lot / step + 1e-9) * step, 2)
@@ -126,7 +128,7 @@ def calculate_lot_size(symbol, sl_dist, balance, target_risk_usd=None, risk_pct=
             # Never execute orders that exceed account safety caps (e.g., Gold on micro accounts).
             return None, 0.0, 0.0, (
                 f"REJECTED: Minimum volume ({vol_min}) on {symbol} risks ${actual_risk_usd:.2f} ({risk_pct}% of balance), "
-                f"exceeding max safety limit of {MAX_RISK_PCT}% (${max_allowed_dollar:.2f}). "
+                f"exceeding max safety limit of {cap_pct}% (${max_allowed_dollar:.2f}). "
                 f"Stop loss is too wide for account equity."
             )
 
@@ -137,6 +139,6 @@ def calculate_lot_size(symbol, sl_dist, balance, target_risk_usd=None, risk_pct=
             pip_size = get_pip_size(symbol)
             actual_risk_usd = lot * (sl_dist / pip_size) * _PIP_VALUE_PER_LOT.get(symbol, 10.0)
         risk_pct = round((actual_risk_usd / balance) * 100.0, 1)
-        warn = f"Risk scaled down to {risk_pct}% (${actual_risk_usd:.2f}) to obey {MAX_RISK_PCT}% safety cap"
+        warn = f"Risk scaled down to {risk_pct}% (${actual_risk_usd:.2f}) to obey {cap_pct}% safety cap"
 
     return lot, round(actual_risk_usd, 2), risk_pct, warn
