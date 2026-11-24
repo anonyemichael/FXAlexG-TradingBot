@@ -198,6 +198,8 @@ def send_typing(chat_id=None):
 METHOD_NAMES = {
     "trend":  "📈 Crypto Trend",
     "trend_fast": "⚡ Crypto Trend Fast",
+    "swing4h": "🚀 Crypto Swing 4H",
+    "alexg":  "🧭 AlexG Set & Forget",
     "smc":    "🎯 SMC (yours)",
     "smc_ai": "🧠 SMC + AI",
 }

@@ -73,6 +73,33 @@ TREND_EMA_FAST = 20
 TREND_EMA_SLOW = 100
 TREND_STOP_ATR = 3.0
 
+# --- 4H crypto swing (swing_strategy.py) — account method "swing4h" ---
+# Buy when a 4H candle closes above the previous 42 candles' high (a break of last week's high), stop 2xATR(20),
+# trailed every 4H, no fixed target. Backtest Mar 2024 - Oct 2026 (swing_research.py): 7 coins below + LTC,
+# ~3.8 trades/week, profit factor 1.55, both halves profitable. On 34 OTHER coins it only reached 1.14, so it
+# is unproven: run it on a demo account first. On ~$10 only SOL/XRP/ADA/DOGE fit (BNB/BTC/ETH min lot too big),
+# which is ~1.7 trades/week.
+SWING_SYMBOLS   = ["SOLUSDm", "XRPUSDm", "ADAUSDm", "DOGEUSDm", "BNBUSDm", "BTCUSDm", "ETHUSDm"]
+SWING_BREAK_BARS = 42
+SWING_STOP_ATR  = 2.0
+SWING_MAX_OPEN  = 3
+SWING_MAX_SPREAD_FRAC = 0.15   # skip if the live spread is more than 15% of the stop distance
+
+# --- FXAlexG Set & Forget, mechanical (alexg_strategy.py) — account method "alexg" ---
+# W1+D1+4H structure in sync, pullback into a daily AOI, 4H shift of structure + engulfing close, stop beyond
+# the pullback, target 1:2.5, no management. Backtest: ~7 trades/week on these 28 pairs + gold but profit
+# factor only 1.06 (2024-26) / 1.09 (2020-25, 8 symbols) with drawdowns of ~55R: about break-even.
+# Demo / research only. Forex and gold need roughly $150+ (0.01 lot); smaller accounts skip every signal.
+ALEXG_SYMBOLS = [
+    "EURUSDm", "GBPUSDm", "USDJPYm", "AUDUSDm", "USDCADm", "USDCHFm", "NZDUSDm",
+    "EURJPYm", "GBPJPYm", "AUDJPYm", "CADJPYm", "CHFJPYm",
+    "EURGBPm", "EURAUDm", "EURCADm", "EURCHFm", "EURNZDm", "GBPAUDm", "GBPCADm", "GBPCHFm",
+    "AUDCADm", "AUDCHFm", "AUDNZDm", "NZDCADm", "NZDCHFm", "CADCHFm", "XAUUSDm",
+]
+ALEXG_PARAMS   = {}    # overrides for alexg_strategy.DEFAULTS, e.g. {"rr": 3.0}
+ALEXG_MAX_OPEN = 3
+ALEXG_BARS     = 1600  # 4H candles fetched per symbol (~1 year: builds the W1/D1 trend and AOIs)
+
 # Pairs to scan (SMC strategy only)
 # XAUUSDm removed 2026-11-03: real MT5 history (May–Oct 2026) shows gold lost $270 of the $289 total
 # (11 of 12 trades lost, all 5 margin stop-outs); everything else was about break-even. Its 0.01 minimum

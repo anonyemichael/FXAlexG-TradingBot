@@ -26,6 +26,8 @@ On a slow AI or bridge the bot retries instead of dropping a trade, and never se
 |---|---|---|---|
 | `trend` | Buy when daily EMA20 crosses above EMA100. Stop 3×ATR(20), raised daily. Exit when EMA20 closes below EMA100. Long only, no fixed target. | SOL, XRP, ADA, DOGE, BNB, BTC, ETH (BNB/BTC/ETH skipped on ~$20 accounts: min lot too big) | ~9/year total |
 | `trend_fast` | Same rules with EMA15/80 (7-coin backtest PF 2.31, both halves profitable; deeper drawdowns). | Same 7 coins | ~13/year total |
+| `swing4h` | Buy when a 4H candle closes above the last 42 candles' high. Stop 2×ATR(20), trailed every 4H. No fixed target. Long only. Unproven: PF 1.55 on 8 big coins, 1.14 on 34 others. Demo first. | SOL, XRP, ADA, DOGE, BNB, BTC, ETH (~$10 fits SOL/XRP/ADA/DOGE only) | ~3.8/week (≈1.7/week on $10) |
+| `alexg` | FXAlexG Set & Forget, mechanical: W1+D1+4H in sync, pullback to daily AOI, 4H shift of structure + engulfing, 1:2.5 target. Backtest ≈ break-even (PF 1.06). Demo / research only. | 27 forex pairs + gold (needs ~$150+) | ~7/week |
 | `smc` | Owner's original ICT/SMC A+ setups, mechanical. | Best 5: BTCUSD, EURJPY, GBPUSD, GBPJPY, ETHUSD (gold removed) | 3-4/week |
 | `smc_ai` | Same, but Gemini must approve (and can upgrade B+). If the AI is unreachable, A+ trades anyway. | same | fewer |
 
@@ -66,6 +68,10 @@ Original bot: 12 trades Oct 18–30, 2 real wins, about −$15.60 net; then 0 tr
 | Trend on gold+silver | 12 | 2.34 | 4.39 | 0.58 | Fail (too few, recent lost) |
 | London breakout 1R | 8,729 | 1.00 | 1.01 | 1.00 | Fail (break-even) |
 | London breakout 2R | 8,729 | 1.04 | 1.05 | 1.04 | Fail (gone after slippage) |
+| FXAlexG Set & Forget, 28 pairs 4H (2024–26) | 661 | 1.06 | 1.07 | 1.05 | Fail (break-even; see ALEXG_RESEARCH.md) |
+| FXAlexG Set & Forget, 8 crypto 4H | 333 | 0.98 | – | – | Fail |
+| Crypto 4H 42-candle breakout, trailing (8 coins, 2024–26) | 498 | 1.55 | 1.25 | 1.84 | Pass in-sample |
+| Same rules on 34 other coins (out-of-sample) | 1,768 | 1.14 | 0.97 | 1.30 | Weak → demo first |
 
 Crypto trend held for all 12 nearby settings. A 4H version failed. SOL gave much of the profit; only one signal since Jan 2025.
 Forex can't run on $20: one 3×ATR stop at the 0.01 minimum lot ≈ $15 on EURUSD (75% of $20), ≈ $190 on gold.
@@ -109,7 +115,7 @@ Every trade message starts with the bot that took it: **📈 Crypto Trend · #lo
 (opened, skipped, rejected, TP1, closed with ✅ WIN / ❌ LOSS). SMC scan summaries are labelled **🎯 SMC scanner**.
 **🏆 Scoreboard** button / `/scoreboard`: refreshes every account's balance and ranks the bots by closed-trade P&L, win rate, open trades.
 `/start` menu · `/status` balance · `/report` P&L · `/accounts` list · `/connect` add account ·
-`/strategy [login] [trend|trend_fast|smc|smc_ai]` · `/risk [login] [pct]` · `/pause [login]` · `/resume [login]` · `/remove [login]` ·
+`/strategy [login] [trend|trend_fast|swing4h|alexg|smc|smc_ai]` · `/risk [login] [pct]` · `/pause [login]` · `/resume [login]` · `/remove [login]` ·
 `/news` · `/ai [pair]` · `/pulse` · any other text = AI chat.
 
 ## 8. Operations (VPS: `ssh trading-bot`)

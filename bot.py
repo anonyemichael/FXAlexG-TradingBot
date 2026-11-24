@@ -16,6 +16,8 @@ import traceback
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+import pandas as pd
+
 import config
 import bridge_client as bridge
 import data_provider as dp
@@ -27,6 +29,8 @@ import notifier
 import ai_engine
 import account_manager
 import trend_strategy
+import swing_strategy
+import alexg_strategy
 
 ACCOUNT_WIZARDS = {}  # {chat_id: {"step": "...", "server": "...", "login": 123, ...}}
 
@@ -195,6 +199,10 @@ def manage_open_positions(login=None, is_master=True):
 
         if trade.get("trigger") in trend_strategy.TRIGGERS:
             continue  # trend trades are managed once per day by manage_trend_positions()
+        if trade.get("trigger") in swing_strategy.TRIGGERS:
+            continue  # 4H swing trades: stop trailed every 4H by manage_swing_positions()
+        if trade.get("trigger") == alexg_strategy.TRIGGER:
+            continue  # Set & Forget: broker-side SL/TP only, no partials / TTL / trailing
 
         entry     = trade["entry"]
         tp1       = trade.get("tp1")
@@ -332,10 +340,20 @@ def _revalidate_at_market(setup):
     live = bridge.get_price(setup["symbol"])
     if live is None:
         return True  # can't check; keep the candle-based plan
-    if setup.get("trigger") in trend_strategy.TRIGGERS:
-        # Trend trades have no TP; the stop is a fixed ATR distance from the actual fill.
+    if setup.get("trigger") in trend_strategy.TRIGGERS or setup.get("trigger") in swing_strategy.TRIGGERS:
+        # Trend / swing trades have no TP; the stop is a fixed ATR distance from the actual fill.
         setup["entry"] = live
         setup["sl"] = round(live - setup["sl_dist"], 6)
+        return True
+    if setup.get("trigger") == alexg_strategy.TRIGGER:
+        # Set & Forget: keep the structural stop, re-price the 1:rr target from the live price.
+        buy = setup["direction"] == "bullish"
+        risk = (live - setup["sl"]) if buy else (setup["sl"] - live)
+        if risk <= 0 or risk > 1.5 * setup["sl_dist"]:
+            print(f"[{_ts()}] {setup['symbol']}: live price {live} moved too far from the signal. Skipping.")
+            return False
+        setup["entry"], setup["sl_dist"] = live, risk
+        setup["tp"] = setup["tp2"] = round(live + (risk if buy else -risk) * setup["rr"], 6)
         return True
     buy = setup["direction"] == "bullish"
     risk = (live - setup["sl"]) if buy else (setup["sl"] - live)
@@ -420,12 +438,21 @@ def _dispatch_setup_to_accounts(setup, side, grade, score, has_news=False, metho
             if any(p["symbol"] == symbol for p in acc_pos):
                 print(f"[{_ts()}] Multi-Account: #{login} already holds {symbol} — skipped.")
                 continue
-            is_trend = setup.get("trigger") in trend_strategy.TRIGGERS
-            max_open = getattr(config, "TREND_MAX_OPEN", 4) if is_trend else config.MAX_CONCURRENT
+            trig = setup.get("trigger")
+            if trig in trend_strategy.TRIGGERS:
+                max_open = getattr(config, "TREND_MAX_OPEN", 4)
+            elif trig in swing_strategy.TRIGGERS:
+                max_open = getattr(config, "SWING_MAX_OPEN", 3)
+            elif trig == alexg_strategy.TRIGGER:
+                max_open = getattr(config, "ALEXG_MAX_OPEN", 3)
+            else:
+                max_open = config.MAX_CONCURRENT
+            is_smc = trig not in trend_strategy.TRIGGERS and trig not in swing_strategy.TRIGGERS \
+                and trig != alexg_strategy.TRIGGER
             if len(acc_pos) >= max_open:
                 print(f"[{_ts()}] Multi-Account: #{login} has {len(acc_pos)} open (max {max_open}) — skipped.")
                 continue
-            if not is_trend:
+            if is_smc:
                 if trade_logger.get_daily_trade_count(login) >= config.MAX_TRADES_DAY:
                     print(f"[{_ts()}] Multi-Account: #{login} daily trade limit reached — skipped.")
                     continue
@@ -526,6 +553,7 @@ def manage_other_accounts():
             check_closed_positions(login, is_master=False)
             manage_open_positions(login, is_master=False)   # SMC: TP1 / breakeven / trailing / TTL
             manage_trend_positions(login, is_master=False)  # trend: chandelier stop / EMA exit
+            manage_swing_positions(login, is_master=False)  # 4H swing: chandelier stop
     finally:
         if switched:
             _restore_master()
@@ -564,6 +592,121 @@ def manage_trend_positions(login=None, is_master=True):
                 print(f"[{_ts()}] Trend {symbol} #{ticket}: stop raised to {new_sl:.5f}")
             else:
                 print(f"[{_ts()}] Trend {symbol} #{ticket}: stop raise failed: {res}")
+
+
+_swing_scanned = set()   # {(symbol, candle_time)} — one entry check per symbol per closed 4H candle
+_alexg_scanned = set()
+
+
+def _spread_vs_stop_ok(symbol, sl_dist, max_frac):
+    """False if the live spread eats more than max_frac of the stop distance (thin crypto books, rollover)."""
+    info = bridge.get_symbol_info(symbol) or {}
+    sp, tick = info.get("spread"), info.get("tick_size")
+    if not sp or not tick or not sl_dist:
+        return True
+    return sp * tick <= max_frac * sl_dist
+
+
+def _last_closed_4h():
+    """Open time of the 4H candle that closed most recently (UTC-aligned, as on Exness server time)."""
+    now = datetime.now(timezone.utc)
+    return str(pd.Timestamp(now).floor("4h") - pd.Timedelta(hours=4))
+
+
+def run_swing_scan():
+    """4H crypto swing entries (accounts assigned 'swing4h'). Safe to call often: each symbol is
+    evaluated once per closed 4H candle (and not even downloaded again once it has been)."""
+    if not bridge.get_account():
+        print(f"[{_ts()}] MT5 bridge offline — swing scan skipped.")
+        return
+    expected = _last_closed_4h()
+    for symbol in getattr(config, "SWING_SYMBOLS", []):
+        if (symbol, expected) in _swing_scanned:
+            continue
+        df = dp.get_4h(symbol, count=300)
+        if df is None or len(df) < 80:
+            continue
+        closed = alexg_strategy.closed_bars(df, 4)
+        if closed.empty:
+            continue
+        key = (symbol, str(closed.index[-1]))
+        if key in _swing_scanned:
+            continue
+        _swing_scanned.add(key)
+        setup = swing_strategy.entry_signal(symbol, df)
+        if not setup:
+            print(f"[{_ts()}] Swing4H {symbol}: no break of the {swing_strategy.BREAK_BARS}-candle high.")
+            continue
+        if not _spread_vs_stop_ok(symbol, setup["sl_dist"], getattr(config, "SWING_MAX_SPREAD_FRAC", 0.15)):
+            print(f"[{_ts()}] Swing4H {symbol}: spread too wide for a {setup['sl_dist']:.6g} stop. Skipping.")
+            continue
+        print(f"[{_ts()}] Swing4H {symbol}: closed above the {swing_strategy.BREAK_BARS}-candle high — buying.")
+        _dispatch_setup_to_accounts(setup, "buy", setup["grade"], setup["score"], methods=("swing4h",))
+
+
+def manage_swing_positions(login=None, is_master=True):
+    """Raises 4H swing stops to the chandelier level (highest close since entry - k x ATR). Never lowers them."""
+    if login is None:
+        login = _master_login()
+    open_tickets = trade_logger.get_open_trade_tickets(login, is_master)
+    if not open_tickets:
+        return
+    live_positions = bridge.get_positions()
+    if not live_positions:
+        return
+    live_by_ticket = {p["ticket"]: p for p in live_positions}
+    for ticket in open_tickets:
+        trade = trade_logger.get_trade_by_ticket(ticket)
+        pos = live_by_ticket.get(ticket)
+        if not trade or not pos or trade.get("trigger") not in swing_strategy.TRIGGERS:
+            continue
+        symbol = trade["symbol"]
+        df = dp.get_4h(symbol, count=300)
+        action, new_sl = swing_strategy.manage(df, trade["opened_at"], pos.get("sl", 0.0))
+        if action == "trail":
+            res = bridge.modify_sl(ticket, round(new_sl, 6))
+            if res and "error" not in res:
+                print(f"[{_ts()}] Swing4H {symbol} #{ticket}: stop raised to {new_sl:.6g}")
+            else:
+                print(f"[{_ts()}] Swing4H {symbol} #{ticket}: stop raise failed: {res}")
+
+
+def run_alexg_scan():
+    """FXAlexG Set & Forget entries (accounts assigned 'alexg'), evaluated once per closed 4H candle."""
+    if not bridge.get_account():
+        print(f"[{_ts()}] MT5 bridge offline — Set & Forget scan skipped.")
+        return
+    forex_open = is_forex_market_open()
+    expected = _last_closed_4h()
+    for symbol in getattr(config, "ALEXG_SYMBOLS", []):
+        crypto = any(c in symbol.upper() for c in ("BTC", "ETH", "SOL", "XRP", "ADA", "DOGE", "BNB", "LTC"))
+        if (not forex_open and not crypto) or (symbol, expected) in _alexg_scanned:
+            continue
+        try:
+            df = dp.get_4h(symbol, count=getattr(config, "ALEXG_BARS", 1600))
+            if df is None or len(df) < 300:
+                continue
+            closed = alexg_strategy.closed_bars(df, 4)
+            key = (symbol, str(closed.index[-1])) if len(closed) else None
+            if key is None or key in _alexg_scanned:
+                continue
+            _alexg_scanned.add(key)
+            setup = alexg_strategy.entry_signal(symbol, df, getattr(config, "ALEXG_PARAMS", {}))
+            if not setup:
+                continue
+            has_news, news_title = news_filter.has_high_impact_news_soon(symbol, config.NEWS_LOOKOUT_MINS)
+            if has_news:
+                print(f"[{_ts()}] S&F {symbol}: setup skipped, high-impact news soon ('{news_title}').")
+                continue
+            if not bridge.spread_ok(symbol):
+                print(f"[{_ts()}] S&F {symbol}: spread too wide. Skipping.")
+                continue
+            side = "buy" if setup["direction"] == "bullish" else "sell"
+            print(f"[{_ts()}] S&F {symbol}: {side.upper()} setup — {'; '.join(setup['met'])}")
+            _dispatch_setup_to_accounts(setup, side, setup["grade"], setup["score"], methods=("alexg",))
+        except Exception as e:
+            print(f"[{_ts()}] S&F scan error on {symbol}: {e}")
+            traceback.print_exc()
 
 
 def run_scan(kill_zone=None):
@@ -1085,7 +1228,7 @@ def _handle_show_accounts(chat_id, user_id=None):
         )
     lines.append(
         "🏆 /scoreboard — who is winning\n"
-        "<code>/strategy [login] [trend|trend_fast|smc|smc_ai]</code> · <code>/risk [login] [pct]</code>\n"
+        "<code>/strategy [login] [trend|trend_fast|swing4h|alexg|smc|smc_ai]</code> · <code>/risk [login] [pct]</code>\n"
         "<code>/pause [login]</code> · <code>/resume [login]</code> · <code>/remove [login]</code>"
     )
     notifier.send("\n".join(lines), chat_id=chat_id)
@@ -1377,6 +1520,7 @@ def main():
 
     last_scan_slot  = (-1, -1)
     last_trend_slot = None
+    last_h4_slot    = None
     last_other_check = 0.0
     last_ema_check  = 0.0
     weekly_report_sent = False
@@ -1438,6 +1582,18 @@ def main():
                     manage_trend_positions()
                     run_trend_scan()
                     last_trend_slot = hour_slot
+
+            if in_use & {"swing4h", "alexg"}:
+                # 4H methods: a few minutes after each 4H close (00/04/08/12/16/20 UTC), plus a retry
+                # every 30 min in case the bridge was busy (each symbol is evaluated once per candle).
+                h4_slot = (now.strftime("%Y-%m-%d"), h // 4, m // 30)
+                if m % 30 >= 3 and h4_slot != last_h4_slot:
+                    last_h4_slot = h4_slot
+                    if "swing4h" in in_use:
+                        manage_swing_positions()
+                        run_swing_scan()
+                    if "alexg" in in_use:
+                        run_alexg_scan()
 
             if in_use & {"smc", "smc_ai"}:
                 # Kill Zone & 4H Candle Close Scans

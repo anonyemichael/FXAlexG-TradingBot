@@ -220,7 +220,7 @@ def set_account_risk(login: int, risk_pct: float) -> bool:
     return changed
 
 
-STRATEGIES = ("trend", "trend_fast", "smc", "smc_ai")
+STRATEGIES = ("trend", "trend_fast", "swing4h", "alexg", "smc", "smc_ai")
 
 
 def set_account_strategy(login: int, strategy: str) -> bool:
