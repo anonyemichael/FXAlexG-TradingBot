@@ -26,6 +26,7 @@ GitHub's cache, encrypted with your bot token, so nothing readable is stored in 
 | `/filter` | Bitcoin trend filter (on = trading allowed) | seconds to ~1 min |
 | `/gold` | gold trend (buys or sells only), next buy/sell level, whether your balance can size it | seconds to ~1 min |
 | `/goldrisk 2` | gold risk per trade in % (0.5–8, tested default 2; see GOLD_FOREX_RESEARCH.md) | seconds to ~1 min |
+| `/goldlogin ACCOUNT PASSWORD SERVER` · `/goldlogout` | trade gold on a separate account (e.g. Exness Standard Cent, so small balances size properly); crypto stays on the main account | seconds to ~1 min |
 | `/quiet` · `/verbose` | turn the hourly "checked, nothing new" note off / on | seconds to ~1 min |
 | `/status` | live balance, open trades, P&L | ~3 min |
 | `/trades` | last 10 closed trades | ~3 min |

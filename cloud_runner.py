@@ -29,12 +29,21 @@ import requests
 import config
 import metals_strategy as MS
 import momentum_strategy as M
-from cloud_common import CONTROL_STATE, DEFAULT_SERVER, RUNNER_STATE, gold_text, load_json, save_json, tg_send
+from cloud_common import (CONTROL_STATE, DEFAULT_SERVER, RUNNER_GOLD_STATE, RUNNER_STATE, gold_text, load_json,
+                          save_json, tg_send)
 
 MAGIC = 26112501
 MAGIC_TEST = MAGIC + 1        # /testtrade positions (opened and closed in the same run)
 MAGIC_METAL = MAGIC + 2       # gold 1H breakout trades (buys and sells)
 COMMENT = {"mom_4h": "MOM 4H", "mom_d1": "MOM D1"}
+
+
+MONEY_SCALE = 1.0             # 0.01 on cent accounts (balance and profits in US cents)
+
+
+def usd(v, sign=False):
+    v = float(v) * MONEY_SCALE
+    return ("$" + format(v, "+.2f")) if sign else ("$" + format(v, ".2f"))
 
 
 def log(msg):
@@ -184,7 +193,7 @@ def size_trade(info, sl_dist, balance, risk_pct, cap_pct):
         if min_risk <= balance * cap_pct / 100:
             lot = info.volume_min
         else:
-            return None, min_risk, (f"minimum lot {info.volume_min} would risk ${min_risk:.2f} "
+            return None, min_risk, (f"minimum lot {info.volume_min} would risk {usd(min_risk)} "
                                     f"({min_risk / balance * 100:.0f}% of balance), cap is {cap_pct:.0f}%")
     lot = round(min(lot, info.volume_max), dec)
     return lot, lot * loss_per_lot, None
@@ -323,7 +332,11 @@ def run(mt5, env, state, control=None, http=requests, now=None):
     token = env.get("MOMENTUM_TELEGRAM_TOKEN") or ""
     chat = str(env.get("MOMENTUM_TELEGRAM_CHAT_ID") or control.get("tg_chat")
                or getattr(config, "MOMENTUM_TELEGRAM_CHAT_ID", "") or "") or None
-    notify = (lambda t: tg_send(http, token, chat, t)) if live else (lambda _t: False)
+    engines = set((env.get("BOT_ENGINES") or "crypto,gold").split(","))
+    crypto_on = "crypto" in engines
+    gold_pass = env.get("BOT_PASS") == "gold"              # the separate (cent) account that trades gold only
+    prefix = "🥇 <b>Gold account</b> · " if gold_pass else ""
+    notify = (lambda t: tg_send(http, token, chat, prefix + t)) if live else (lambda _t: False)
     plog = []                                                   # private log -> /log in Telegram
     def note(line):
         plog.append(f"{now:%H:%M} {line}")
@@ -389,32 +402,37 @@ def run(mt5, env, state, control=None, http=requests, now=None):
     elif perm["account"]:
         state.pop("readonly_alert", None)
 
-    syms = {s: br.resolve(s) for s in getattr(config, "MOMENTUM_SYMBOLS", [])}
+    syms = {s: br.resolve(s) for s in getattr(config, "MOMENTUM_SYMBOLS", [])} if crypto_on else {}
     missing = [s for s, v in syms.items() if not v]
     if missing:
         note(f"Not on this account: {', '.join(missing)}")
-    btc = br.resolve(getattr(config, "MOMENTUM_REGIME_SYMBOL", "BTCUSDm"))
-    if not btc:
-        log("BTC symbol not available — stopping.")
-        note("BTC symbol not available on this account — can't read the market filter")
-        health["error"] = "BTC symbol missing"
-        return finish(1, "BTC missing")
-    br.calibrate(btc, now)
-    btc_d = br.bars(btc, "mom_d1")
-    on = M.regime_ok(btc_d, now)
-    closed_btc = M.closed_bars(btc_d, 24, now)
-    ema = float(closed_btc["close"].ewm(span=M.REGIME_EMA, adjust=False).mean().iloc[-1])
-    health["filter"] = {"on": bool(on), "btc": float(closed_btc["close"].iloc[-1]), "ema": ema}
-    log(f"Market filter {'ON' if on else 'OFF'}.")
-    note(f"BTC filter {'ON' if on else 'OFF'}: BTC {health['filter']['btc']:,.0f} vs EMA{M.REGIME_EMA} {ema:,.0f}")
-    if state.get("regime") is not None and state["regime"] != on:
-        events.append(f"🛰️ <b>Market filter {'ON' if on else 'OFF'}</b> — BTC closed "
-                      f"{'above' if on else 'below'} its {M.REGIME_EMA}-day EMA.")
-    state["regime"] = bool(on)
+    btc = br.resolve(getattr(config, "MOMENTUM_REGIME_SYMBOL", "BTCUSDm")) if crypto_on else None
+    on, btc_d = False, None
+    if crypto_on and not btc:
+        log("BTC symbol not available — crypto skipped.")
+        note("BTC not on this account (e.g. a cent account) — crypto skipped, gold still checked")
+        health["error"] = "BTC symbol missing: crypto skipped"
+        crypto_on = False
+        syms = {}
+    if crypto_on:
+        br.calibrate(btc, now)
+        btc_d = br.bars(btc, "mom_d1")
+        on = M.regime_ok(btc_d, now)
+        closed_btc = M.closed_bars(btc_d, 24, now)
+        ema = float(closed_btc["close"].ewm(span=M.REGIME_EMA, adjust=False).mean().iloc[-1])
+        health["filter"] = {"on": bool(on), "btc": float(closed_btc["close"].iloc[-1]), "ema": ema}
+        log(f"Market filter {'ON' if on else 'OFF'}.")
+        note(f"BTC filter {'ON' if on else 'OFF'}: BTC {health['filter']['btc']:,.0f} vs EMA{M.REGIME_EMA} {ema:,.0f}")
+        if state.get("regime") is not None and state["regime"] != on:
+            events.append(f"🛰️ <b>Market filter {'ON' if on else 'OFF'}</b> — BTC closed "
+                          f"{'above' if on else 'below'} its {M.REGIME_EMA}-day EMA.")
+        state["regime"] = bool(on)
 
     acct = mt5.account_info()
+    global MONEY_SCALE
+    MONEY_SCALE = 0.01 if str(getattr(acct, "currency", "USD") or "").upper() == "USC" else 1.0
     balance = float(acct.balance) if acct else 0.0
-    health["balance"] = f"${balance:.2f}"
+    health["balance"] = f"{usd(balance)}"
 
     def close_pos(pos, why):
         ok_, code, msg = br.close(pos) if live else (True, None, "")
@@ -426,7 +444,7 @@ def run(mt5, env, state, control=None, http=requests, now=None):
         if r["cmd"] == "close":
             want = r["arg"].upper().rstrip("MC")
             hits = [p for p in br.all_positions() if p.symbol.upper().rstrip("MC") == want]
-            if not hits:
+            if not hits and not gold_pass:
                 notify(f"🛰️ No open bot trade on {r['arg']}.")
             for p in hits:
                 ok_, code, msg = close_pos(p, "you asked")
@@ -434,9 +452,11 @@ def run(mt5, env, state, control=None, http=requests, now=None):
         elif r["cmd"] == "closeall":
             ps = br.all_positions()
             res = [close_pos(p, "close all")[0] for p in ps]
-            notify(f"✅ Closed {sum(res)} of {len(ps)} bot trades." if ps else "🛰️ No open bot trades.")
+            if ps or not gold_pass:
+                notify(f"✅ Closed {sum(res)} of {len(ps)} bot trades." if ps else "🛰️ No open bot trades.")
         elif r["cmd"] == "testtrade" and live:
-            notify(test_trade(mt5, br, syms, note))
+            pool = {**syms, **{x: br.resolve(x) for x in MS.SYMBOLS}} if gold_pass or not syms else syms
+            notify(test_trade(mt5, br, pool, note))
 
     # 2. manage open trades
     for pos in br.positions():
@@ -449,6 +469,9 @@ def run(mt5, env, state, control=None, http=requests, now=None):
                           + ("" if ok_ else f" ({code} {msg})"))
         elif action == "trail":
             tick, info = mt5.symbol_info_tick(pos.symbol), mt5.symbol_info(pos.symbol)
+            if tick is None or info is None:
+                note(f"{pos.symbol}: no price right now, stop left at {pos.sl:.6g}")
+                continue
             min_gap = (getattr(info, "trade_stops_level", 0) or 0) * info.point
             if new_sl > (pos.sl or 0) + info.point and new_sl < tick.bid - min_gap:
                 if live:
@@ -457,16 +480,21 @@ def run(mt5, env, state, control=None, http=requests, now=None):
                     if ok_:
                         events.append(f"🛰️ {pos.symbol}: stop raised to {new_sl:.6g}")
         else:
-            note(f"{pos.symbol}: holding, stop {pos.sl:.6g}, P&L ${pos.profit:+.2f}")
+            note(f"{pos.symbol}: holding, stop {pos.sl:.6g}, P&L {usd(pos.profit, True)}")
 
     # 2b. gold trades (buys and sells): trail the stop after every 1H close
-    gold_on = getattr(config, "METALS_ENABLED", True)
+    gold_on = getattr(config, "METALS_ENABLED", True) and "gold" in engines
     gsyms = {s: br.resolve(s) for s in (MS.SYMBOLS if gold_on else [])}
+    if not crypto_on and any(gsyms.values()):
+        br.calibrate(next(v for v in gsyms.values() if v), now)
     for pos in br.positions(MAGIC_METAL):
         d = side_of(pos)
         new_sl = MS.manage(br.bars(pos.symbol, "met_1h", 400), d, br.utc(pos.time), pos.sl,
                            getattr(pos, "price_open", None), now)
         tick, info = mt5.symbol_info_tick(pos.symbol), mt5.symbol_info(pos.symbol)
+        if tick is None or info is None:
+            note(f"{pos.symbol}: no price right now, stop left at {pos.sl:.6g}")
+            continue
         min_gap = (getattr(info, "trade_stops_level", 0) or 0) * info.point
         valid = new_sl is not None and (new_sl < tick.bid - min_gap if d > 0 else new_sl > tick.ask + min_gap) \
             and abs(new_sl - (pos.sl or 0)) > info.point
@@ -478,21 +506,23 @@ def run(mt5, env, state, control=None, http=requests, now=None):
                 events.append(f"🥇 {pos.symbol} {'BUY' if d > 0 else 'SELL'}: stop "
                               f"{'raised' if d > 0 else 'lowered'} to {new_sl:.6g}")
         else:
-            note(f"{pos.symbol} {'BUY' if d > 0 else 'SELL'}: holding, stop {pos.sl:.6g}, P&L ${pos.profit:+.2f}")
+            note(f"{pos.symbol} {'BUY' if d > 0 else 'SELL'}: holding, stop {pos.sl:.6g}, P&L {usd(pos.profit, True)}")
 
     # 3. trades closed since the last run
     since = pd.Timestamp(state["last_run"], unit="s", tz="UTC") if state.get("last_run") else now - pd.Timedelta(hours=2)
     for d in br.deals(since):
         if d.entry == mt5.DEAL_ENTRY_OUT:
             res = d.profit + getattr(d, "swap", 0.0) + getattr(d, "commission", 0.0)
-            events.append(f"🏁 <b>Closed {d.symbol}</b> {'✅' if res > 0 else '❌'} <b>${res:+.2f}</b>")
-            note(f"Closed {d.symbol}: ${res:+.2f}")
+            events.append(f"🏁 <b>Closed {d.symbol}</b> {'✅' if res > 0 else '❌'} <b>{usd(res, True)}</b>")
+            note(f"Closed {d.symbol}: {usd(res, True)}")
 
     # 4. new entries
     entries = 0
     risk = float(control.get("risk_pct") or env.get("MOMENTUM_RISK_PCT") or getattr(config, "MOMENTUM_RISK_PCT", 5.0))
     if control.get("paused"):
         note("Paused by you (/resume to allow new trades)")
+    elif not crypto_on:
+        pass
     elif not on:
         note("No new buys: BTC filter is off")
     else:
@@ -534,12 +564,12 @@ def run(mt5, env, state, control=None, http=requests, now=None):
                     entries += 1
                     continue
                 ok_, code, msg = br.buy(sym, lot, sl, COMMENT[eng])
-                note(f"BUY {sym} {lot} lot, stop {sl:.6g}, risk ${risk_usd:.2f}: {'ok' if ok_ else f'REJECTED {code} {msg}'}")
+                note(f"BUY {sym} {lot} lot, stop {sl:.6g}, risk {usd(risk_usd)}: {'ok' if ok_ else f'REJECTED {code} {msg}'}")
                 if ok_:
                     entries += 1
                     events.append(f"🟢 <b>BUY {sym}</b> ({label} breakout)\nEntry ~{tick.ask:.6g} · Stop {sl:.6g} "
                                   f"({setup['sl_dist'] / tick.ask * 100:.1f}% away, trails up) · Lots {lot}\n"
-                                  f"Risk ${risk_usd:.2f} ({risk_usd / balance * 100:.1f}% of ${balance:.2f})\n"
+                                  f"Risk {usd(risk_usd)} ({risk_usd / balance * 100:.1f}% of {usd(balance)})\n"
                                   f"Why: {setup['met'][1]}; {setup['met'][0]}")
                 else:
                     events.append(f"❌ {sym} order rejected ({code} {msg})")
@@ -564,6 +594,8 @@ def run(mt5, env, state, control=None, http=requests, now=None):
                      stop=MS.STOP_ATR * a)
             if info is not None and info.trade_tick_size:
                 g["min_risk"] = info.volume_min * MS.STOP_ATR * a / info.trade_tick_size * info.trade_tick_value
+                g["min_risk_pct"] = g["min_risk"] / balance * 100 if balance else None
+                g["min_risk"] *= MONEY_SCALE
         health["gold"] = g
         if control.get("paused"):
             gold_note = "paused"
@@ -609,39 +641,42 @@ def run(mt5, env, state, control=None, http=requests, now=None):
             entries += 1
             continue
         ok_, code, msg = br.order(sym, d, lot, sl, MS.COMMENT, MAGIC_METAL)
-        note(f"{side} {sym} {lot} lot, stop {sl:.6g}, risk ${risk_usd:.2f}: {'ok' if ok_ else f'REJECTED {code} {msg}'}")
+        note(f"{side} {sym} {lot} lot, stop {sl:.6g}, risk {usd(risk_usd)}: {'ok' if ok_ else f'REJECTED {code} {msg}'}")
         if ok_:
             entries += 1
             gold_note = f"{side.lower()} opened"
             events.append(f"{'🟢' if d > 0 else '🔴'} <b>{side} {sym}</b> ({MS.LABEL} {'breakout' if d > 0 else 'breakdown'})\n"
                           f"Entry ~{price:,.2f} · Stop {sl:,.2f} ({setup['sl_dist']:,.2f} away, trails "
                           f"{'up' if d > 0 else 'down'}) · Lots {lot}\n"
-                          f"Risk ${risk_usd:.2f} ({risk_usd / balance * 100:.1f}% of ${balance:.2f})\n"
+                          f"Risk {usd(risk_usd)} ({risk_usd / balance * 100:.1f}% of {usd(balance)})\n"
                           f"Why: {setup['met'][1]}; {setup['met'][0]}")
         else:
             events.append(f"❌ {sym} {side} order rejected ({code} {msg})")
+    state["gold_note"] = gold_note
     log(f"Checked {sum(1 for s in syms.values() if s) + sum(1 for s in gsyms.values() if s)} symbols; "
         f"{entries} new entr{'y' if entries == 1 else 'ies'}.")
     health["open"] = len(br.all_positions())
 
     # 5. Telegram replies, events, daily summary
     def status():
-        lines = ["🛰️ <b>Momentum bot — status</b>"]
+        lines = ["🛰️ <b>" + ("status" if gold_pass else "Momentum bot — status") + "</b>"]
         a = mt5.account_info()
         if a:
-            lines.append(f"Balance <b>${a.balance:.2f}</b> · Equity <b>${a.equity:.2f}</b>")
-        lines.append(f"New trades: {'PAUSED ⏸️' if control.get('paused') else 'on'} · Risk {risk:g}%/trade crypto, "
-                     f"{grisk:g}% gold")
+            lines.append(f"Balance <b>{usd(a.balance)}</b> · Equity <b>{usd(a.equity)}</b>")
+        lines.append(f"New trades: {'PAUSED ⏸️' if control.get('paused') else 'on'} · Risk "
+                     + (f"{grisk:g}%/trade gold" if gold_pass else
+                        f"{risk:g}%/trade crypto" + ("" if control.get("_gold_account") else f", {grisk:g}% gold")))
         ps = br.all_positions()
         lines.append(f"\n<b>Open trades: {len(ps)}</b>")
         for p in ps:
             kind = MS.LABEL if p.magic == MAGIC_METAL else ("Daily" if engine_of(p) == "mom_d1" else "4H")
             lines.append(f"• {'SELL' if side_of(p) < 0 else 'BUY'} {p.symbol} ({kind}) "
-                         f"{p.volume} lot, stop {p.sl:.6g}, P&L ${p.profit:+.2f}")
+                         f"{p.volume} lot, stop {p.sl:.6g}, P&L {usd(p.profit, True)}")
         closed = [d for d in br.deals(now - pd.Timedelta(days=7)) if d.entry == mt5.DEAL_ENTRY_OUT]
-        lines.append(f"\nLast 7 days: {len(closed)} closed, <b>${sum(d.profit for d in closed):+.2f}</b>")
-        lines.append("\n" + filter_text(btc_d, now))
-        if health.get("gold"):
+        lines.append(f"\nLast 7 days: {len(closed)} closed, <b>{usd(sum(d.profit for d in closed), True)}</b>")
+        if btc_d is not None:
+            lines.append("\n" + filter_text(btc_d, now))
+        if health.get("gold") and gold_on:
             lines.append("\n" + gold_text(health["gold"], balance))
         return "\n".join(lines)
 
@@ -650,7 +685,7 @@ def run(mt5, env, state, control=None, http=requests, now=None):
         if not ds:
             return "🛰️ No closed bot trades yet."
         return "🛰️ <b>Last bot trades</b>\n" + "\n".join(
-            f"• {br.utc(d.time):%d %b} {d.symbol}: <b>${d.profit:+.2f}</b>" for d in ds)
+            f"• {br.utc(d.time):%d %b} {d.symbol}: <b>{usd(d.profit, True)}</b>" for d in ds)
 
     if live:
         for r in requests_:
@@ -659,7 +694,7 @@ def run(mt5, env, state, control=None, http=requests, now=None):
                     state["summary_day"] = now.strftime("%Y-%m-%d")      # counts as today's summary
             elif r["cmd"] == "trades":
                 notify(trades())
-            elif r["cmd"] == "run":
+            elif r["cmd"] == "run" and not gold_pass:
                 notify("✅ Check done. " + (f"{len(events)} update(s) below." if events else
                                            f"Nothing new. {'BTC filter on' if on else 'BTC filter off'}, "
                                            f"{health['open']} open trade(s). /log for details."))
@@ -670,16 +705,62 @@ def run(mt5, env, state, control=None, http=requests, now=None):
         if events:
             notify("\n\n".join(events))
         elif (env.get("GITHUB_EVENT_NAME") == "schedule" or env.get("HOURLY_CHECK") == "true") \
-                and control.get("verbose", True):
+                and control.get("verbose", True) and not gold_pass:
+            gnote = control.get("_gold_note") if control.get("_gold_account") else gold_note
             why = ("paused by you" if control.get("paused") else
-                   ("crypto: no breakouts" if on else "crypto: BTC filter off") + f"; gold: {gold_note}")
+                   ("crypto: no breakouts" if on else "crypto: BTC filter off") + f"; gold: {gnote or 'not checked'}")
             notify(f"🕐 {now:%H:%M} UTC check — {health['open']} open trade(s), no new trades ({why}). "
-                   f"Balance ${balance:.2f}. /quiet to stop these notes.")
+                   f"Balance {usd(balance)}. /quiet to stop these notes.")
         today = now.strftime("%Y-%m-%d")
         if now.hour >= getattr(config, "MONITOR_DAILY_HOUR", 7) and state.get("summary_day") != today:
             if notify("☀️ <b>Daily summary</b>\n\n" + status()):
                 state["summary_day"] = today
     return finish(0, f"ok, {entries} new trade(s)")
+
+
+def _guarded_run(mt5, env, state, control, token, http, what, now=None):
+    """run() with crash reporting; returns the exit code."""
+    try:
+        return run(mt5, env, state, control, http=http, now=now)
+    except Exception as e:
+        log(f"Run failed ({what}): {type(e).__name__}")
+        traceback.print_exc(limit=2)
+        state.setdefault("health", {})["error"] = f"{type(e).__name__}: {str(e)[:200]}"
+        if env.get("MODE", "live") == "live":
+            state["result"] = "crashed"
+            state["last_run"] = datetime.now(timezone.utc).timestamp()
+            chat = env.get("MOMENTUM_TELEGRAM_CHAT_ID") or control.get("tg_chat")
+            tg_send(http, token, chat, f"⚠️ Momentum bot run failed ({what}): {type(e).__name__}: {str(e)[:200]}")
+        return 1
+    finally:
+        try:
+            mt5.shutdown()
+        except Exception:
+            pass
+
+
+def run_accounts(mt5, env, http=requests, runner_path=None, gold_path=None, control_path=None, now=None):
+    """One trading run. With a gold account saved (/goldlogin, e.g. an Exness Standard Cent account), gold is
+    traded there first and the main account trades crypto only; otherwise the main account trades both."""
+    token = env.get("MOMENTUM_TELEGRAM_TOKEN") or ""
+    runner_path, gold_path = runner_path or RUNNER_STATE, gold_path or RUNNER_GOLD_STATE
+    control = load_json(control_path or CONTROL_STATE, token)
+    gcreds = control.get("gold_creds")
+    code, gold_note = 0, None
+    if gcreds:
+        log("Gold account:")
+        gstate = load_json(gold_path, token)
+        genv = {**env, "BOT_ENGINES": "gold", "BOT_PASS": "gold", "MT5_LOGIN": "", "MT5_PASSWORD": ""}
+        code |= _guarded_run(mt5, genv, gstate, {**control, "creds": gcreds}, token, http, "gold account", now)
+        save_json(gold_path, gstate, token)
+        gold_note = gstate.get("gold_note")
+        log("Main account:")
+    state = load_json(runner_path, token)
+    menv = {**env, "BOT_ENGINES": "crypto" if gcreds else (env.get("BOT_ENGINES") or "crypto,gold")}
+    code |= _guarded_run(mt5, menv, state, {**control, "_gold_note": gold_note, "_gold_account": bool(gcreds)},
+                         token, http, "main account", now)
+    save_json(runner_path, state, token)
+    return code
 
 
 def main():
@@ -688,28 +769,7 @@ def main():
     except ImportError:
         log("MetaTrader5 package not installed (this runs on the Windows runner).")
         return 1
-    token = os.environ.get("MOMENTUM_TELEGRAM_TOKEN") or ""
-    state = load_json(RUNNER_STATE, token)
-    control = load_json(CONTROL_STATE, token)
-    code = 1
-    try:
-        code = run(mt5, dict(os.environ), state, control)
-    except Exception as e:
-        log(f"Run failed: {type(e).__name__}")
-        traceback.print_exc(limit=2)
-        state.setdefault("health", {})["error"] = f"{type(e).__name__}: {str(e)[:200]}"
-        state["result"] = "crashed"
-        state["last_run"] = datetime.now(timezone.utc).timestamp()
-        if os.environ.get("MODE", "live") == "live":
-            chat = os.environ.get("MOMENTUM_TELEGRAM_CHAT_ID") or control.get("tg_chat")
-            tg_send(requests, token, chat, f"⚠️ Momentum bot run failed: {type(e).__name__}: {str(e)[:200]}")
-    finally:
-        save_json(RUNNER_STATE, state, token)
-        try:
-            mt5.shutdown()
-        except Exception:
-            pass
-    return code
+    return run_accounts(mt5, dict(os.environ))
 
 
 if __name__ == "__main__":

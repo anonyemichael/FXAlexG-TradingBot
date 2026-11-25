@@ -15,6 +15,7 @@ import os
 
 RUNNER_STATE = os.environ.get("CLOUD_STATE", os.path.join("cloud_state", "runner.json"))
 CONTROL_STATE = os.environ.get("CLOUD_CONTROL", os.path.join("cloud_ctl", "control.json"))
+RUNNER_GOLD_STATE = os.path.join(os.path.dirname(RUNNER_STATE) or ".", "runner_gold.json")   # gold (cent) account
 DEFAULT_SERVER = "Exness-MT5Trial9"
 
 
@@ -71,8 +72,9 @@ def gold_text(g, balance=None):
     if g.get("hi"):
         txt += (f"Next: {'BUY if a 1H candle closes above ' + format(g['hi'], ',.2f') if up else 'SELL if a 1H candle closes below ' + format(g['lo'], ',.2f')}"
                 f" · stop ~{g['stop']:,.2f} away")
-    if g.get("min_risk") and balance:
-        txt += f"\nSmallest lot risks ${g['min_risk']:.2f} ({g['min_risk'] / balance * 100:.1f}% of balance)"
+    pct = g.get("min_risk_pct") or (g["min_risk"] / balance * 100 if g.get("min_risk") and balance else None)
+    if g.get("min_risk") and pct:
+        txt += f"\nSmallest lot risks ${g['min_risk']:.2f} ({pct:.1f}% of balance)"
     return txt
 
 
@@ -88,7 +90,7 @@ HELP = (
     "/gold — gold trend, next buy/sell level, size check\n"
     "/goldrisk 2 — gold risk per trade in % (0.5–8, tested default 2)\n"
     "/quiet · /verbose — hourly check notes off/on\n"
-    "/login ACCOUNT PASSWORD SERVER · /logout\n"
+    "/login ACCOUNT PASSWORD SERVER · /logout\n"    "/goldlogin ACCOUNT PASSWORD SERVER — separate account for gold (e.g. Standard Cent) · /goldlogout\n"
     "<b>Live from MT5</b> (starts a run, reply in ~3 min):\n"
     "/status — balance, open trades, P&amp;L\n"
     "/trades — last 10 closed trades\n"

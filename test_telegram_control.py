@@ -171,6 +171,23 @@ def test_gold_and_goldrisk():
     assert "not checked yet" in texts(http)[0]
 
 
+def test_goldlogin_and_gold_from_gold_account():
+    _, ctl, http = _go([msg(1, 777, "/goldlogin 999 Pw@1 Exness-MT5Real8", mid=31)], {"tg_chat": "777"})
+    assert ctl["gold_creds"] == {"login": "999", "password": "Pw@1", "server": "Exness-MT5Real8"}
+    assert http.deleted == [31] and http.dispatches and "Pw@1" not in " ".join(texts(http))
+    grun = {"last_run": NOW - 120, "health": {"balance": "$224.47", "gold": {
+        "symbol": "XAUUSDc", "trend": 1, "close": 3600.0, "ema": 3400.0, "hi": 3650.0, "lo": 3500.0,
+        "stop": 16.0, "min_risk": 0.16, "min_risk_pct": 0.07}}}
+    http = FakeHTTP([msg(2, 777, "/gold"), msg(3, 777, "/settings"), msg(4, 777, "/goldlogin 999")])
+    T.config.MOMENTUM_TELEGRAM_CHAT_ID = None
+    T.handle(http, ENV, ctl, {}, NOW, grun=grun)
+    gold, settings, bad = texts(http)
+    assert "buys only" in gold and "gold account" in gold and "$0.16 (0.1% of balance)" in gold
+    assert "gold account 999" in settings and "goldlogin 12345678" in bad
+    _go([msg(5, 777, "/goldlogout")], ctl)
+    assert "gold_creds" not in ctl
+
+
 def test_main_saves_before_dispatch():
     import tempfile
     from cloud_common import load_json

@@ -68,11 +68,22 @@ Growth with exact position sizing (compounded, costs included):
 It wins about 1 trade in 3; the winners are much larger than the losers. Losing streaks of 8–12 trades happen.
 
 ## Account size: important
-On an Exness **Standard** account the smallest gold trade is 0.01 lot = 1 ounce. With gold around $3,500 a
+On an Exness **Standard** account the smallest gold trade is 0.01 lot = 1 ounce. With gold around $3,567 a
 typical stop is $16–18 away, so the smallest trade risks **$16–18 — about 7–8% of a $224 account**. The bot's
-gold cap is 5%, so on that balance it skips gold signals (and tells you once per signal). Options:
-1. **Exness Standard Cent account** (`XAUUSDc`): the same trade risks cents, so the bot sizes 2% properly from
-   any balance. The bot finds the `c` symbols automatically. (Cent accounts don't offer crypto.)
-2. Balance of about $350+ (5% cap) or $850+ (true 2%).
-3. `/goldrisk 8` in Telegram: lets the bot take the 1-ounce trade at ~7–8% risk. Allowed, but in the
-   backtest that sizing had drawdowns of 60–80%.
+gold cap is 5%, so on that balance it skips gold signals (and tells you once per signal).
+
+Tighter stops don't fix this. Replaying 2020–2025 at today's gold price on a $224 Standard account trading
+the 1-ounce minimum, every stop size (1–2 × ATR) ended between −20% and +31% a year with worst drawdowns of
+60–86%. The rule's edge survives tighter stops (PF 1.30–1.61), but 1-ounce steps are far too coarse for $224.
+
+**The fix the bot supports: a separate Standard Cent account for gold.** On a cent account the balance is
+counted in US cents, so the same 1-ounce trade risks cents and the bot can size exactly 2%.
+1. Exness Personal Area → *Open new account* → **Standard Cent**, MT5, demo or real. Note the account number,
+   trading password and server.
+2. In Telegram: `/goldlogin ACCOUNT PASSWORD SERVER` (the message is deleted, the login stored encrypted).
+3. Every hourly run then trades **gold on the cent account** (`XAUUSDc`, found automatically) and **crypto on
+   your main account**. Gold messages start with "🥇 Gold account". Cent amounts are shown in dollars.
+   `/goldlogout` moves gold back to the main account.
+
+Other options: a balance of about $350+ (5% cap) or $850+ (true 2%), or `/goldrisk 8` to allow the 1-ounce
+trade at ~7–8% risk (not recommended: the drawdowns above).

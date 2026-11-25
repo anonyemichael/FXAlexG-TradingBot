@@ -377,6 +377,75 @@ def test_gold_skipped_once_when_account_too_small():
     assert [o["volume"] for o in mt5.orders if o["symbol"] == "XAUUSDm"] == [0.01]
 
 
+class TwoAccountMT5(FakeMT5):
+    """Main account 123 (USD, crypto + gold) and a Standard Cent account 999 (USC, gold as XAUUSDc, no crypto)."""
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.h1["XAUUSDc"], self.d1["XAUUSDc"] = self.h1["XAUUSDm"], self.d1["XAUUSDm"]
+        self.login, self.logins = None, []
+
+    def initialize(self, **kw):
+        self.login = kw.get("login")
+        self.logins.append(self.login)
+        return super().initialize(**kw)
+
+    def account_info(self):
+        if self.login == 999:
+            return NS(balance=22447.0, equity=22447.0, login=999, currency="USC")
+        return NS(balance=224.47, equity=224.47, login=123, currency="USD")
+
+    def order_send(self, req):
+        res = super().order_send(req)
+        for p in self.positions:
+            if not hasattr(p, "login"):
+                p.login = self.login
+        return res
+
+    def positions_get(self):
+        return [p for p in self.positions if getattr(p, "login", self.login) == self.login]
+
+    def symbol_info(self, s):
+        cent = self.login == 999
+        if s in ("XAUUSDm", "XAUUSDc"):
+            return super().symbol_info("XAUUSDm") if (s == "XAUUSDc") == cent else None
+        return None if cent else super().symbol_info(s)
+
+
+def test_gold_on_cent_account_crypto_on_main():
+    import tempfile
+    from cloud_common import load_json, save_json
+    d = tempfile.mkdtemp()
+    paths = {k: os.path.join(d, k + ".json") for k in ("run", "gold", "ctl")}
+    save_json(paths["ctl"], {"tg_chat": "999", "creds": {"login": "123", "password": "right", "server": "Exness-MT5Trial9"},
+                             "gold_creds": {"login": "999", "password": "right", "server": "Exness-MT5Trial7"}}, "tok")
+    C.config.MOMENTUM_SYMBOLS, C.config.MOMENTUM_ENGINES = ["SOLUSDm"], ["mom_4h"]
+    mt5, http = TwoAccountMT5(gold="up"), FakeHTTP()
+    env = {"MOMENTUM_TELEGRAM_TOKEN": "tok", "MODE": "live", "MOMENTUM_RISK_PCT": "5", "HOURLY_CHECK": "true"}
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = C.run_accounts(mt5, env, http=http, runner_path=paths["run"], gold_path=paths["gold"],
+                              control_path=paths["ctl"], now=NOW)
+    assert code == 0 and mt5.logins == [999, 123]                      # gold (cent) account first, then main
+    gold = [o for o in mt5.orders if o["symbol"] == "XAUUSDc"]
+    assert len(gold) == 1 and gold[0]["magic"] == C.MAGIC_METAL and gold[0]["volume"] >= 0.02   # 2% of 22,447 USC
+    assert not [o for o in mt5.orders if o["symbol"] == "XAUUSDm"]     # main account doesn't trade gold now
+    assert [o["symbol"] for o in mt5.orders if o["magic"] == C.MAGIC] == ["SOLUSDm"]
+    gmsg = next(t for t in http.sent if "🟢 <b>BUY XAUUSDc</b>" in t)
+    assert gmsg.startswith("🥇 <b>Gold account</b>") and "Risk $3.95 (1.8% of $224.47)" in gmsg   # cents -> dollars
+    assert any("BUY SOLUSDm" in t and "Gold account" not in t for t in http.sent)
+    gstate, mstate = load_json(paths["gold"], "tok"), load_json(paths["run"], "tok")
+    assert gstate["health"]["gold"]["trend"] == 1 and mstate["health"]["login"] == "ok" and "gold" not in mstate["health"]
+
+
+def test_missing_btc_no_longer_stops_gold():
+    class NoCrypto(FakeMT5):
+        def symbol_info(self, s):
+            return super().symbol_info(s) if s.startswith("XAU") else None
+    mt5 = NoCrypto(gold="up", balance=5000.0)
+    code, state, http, out = _run(mt5)
+    assert code == 0 and [o["symbol"] for o in mt5.orders] == ["XAUUSDm"] and "crypto skipped" in out
+
+
 def test_hourly_note_and_quiet():
     env = {**ENV, "GITHUB_EVENT_NAME": "schedule"}
     _, _, http, _ = _run(FakeMT5(btc_up=False), env)

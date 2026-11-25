@@ -16,7 +16,8 @@ import time
 import requests
 
 import config
-from cloud_common import CONTROL_STATE, DEFAULT_SERVER, HELP, RUNNER_STATE, gold_text, load_json, save_json, tg_send
+from cloud_common import (CONTROL_STATE, DEFAULT_SERVER, HELP, RUNNER_GOLD_STATE, RUNNER_STATE, gold_text, load_json,
+                          save_json, tg_send)
 
 LIVE_CMDS = {"/status": "status", "/trades": "trades", "/run": "run", "/testtrade": "testtrade"}
 
@@ -40,7 +41,8 @@ def settings_text(ctl):
             f"Coins: {coins}\n"
             f"Engines: 4H + Daily breakouts, BTC EMA{getattr(config, 'MOMENTUM_REGIME_EMA', 100)} filter\n"
             f"Gold 1H (buy + sell): risk <b>{ctl.get('gold_risk') or getattr(config, 'METALS_RISK_PCT', 2.0):g}%</b> "
-            f"(never above {getattr(config, 'METALS_MAX_RISK_PCT', 5.0):g}%)\n"
+            f"(never above {getattr(config, 'METALS_MAX_RISK_PCT', 5.0):g}%) on "
+            f"{('gold account ' + str(ctl['gold_creds']['login'])) if ctl.get('gold_creds') else 'the main account'}\n"
             f"MT5 login: {('account ' + str(login.get('login')) + ' on ' + str(login.get('server'))) if login else 'GitHub secrets or not set'}")
 
 
@@ -111,7 +113,7 @@ def fetch_updates(http, token, ctl, wait=0):
         return {}
 
 
-def handle(http, env, ctl, run, now, updates=None, dispatcher=None):
+def handle(http, env, ctl, run, now, updates=None, dispatcher=None, grun=None):
     """Process new Telegram messages. Returns True if control state changed."""
     token = env.get("MOMENTUM_TELEGRAM_TOKEN") or ""
     if not token:
@@ -198,6 +200,25 @@ def handle(http, env, ctl, run, now, updates=None, dispatcher=None):
                       f"Your message was deleted. Logging in now — result in ~3 min.")
             else:
                 reply("Send it like this:\n<code>/login 12345678 YourPassword Exness-MT5Trial9</code>")
+        elif cmd == "/goldlogin":
+            try:
+                http.post(f"https://api.telegram.org/bot{token}/deleteMessage",
+                          json={"chat_id": chat, "message_id": msg.get("message_id")}, timeout=15)
+            except Exception:
+                pass
+            if len(parts) >= 4 and parts[1].isdigit():
+                ctl["gold_creds"] = {"login": parts[1], "password": parts[2], "server": parts[3]}
+                queue("run")
+                need_run = True
+                reply(f"✅ Gold account saved (encrypted): {parts[1]} on {parts[3]}. Your message was deleted.\n"
+                      "From now on gold is traded there and crypto stays on your main account. "
+                      "Logging in now — result in ~3 min.")
+            else:
+                reply("Send it like this (server is shown in your Exness Personal Area):\n"
+                      "<code>/goldlogin 12345678 YourPassword Exness-MT5Real8</code>")
+        elif cmd == "/goldlogout":
+            ctl.pop("gold_creds", None)
+            reply("🗑️ Gold account removed: gold goes back to your main account.")
         elif cmd == "/logout":
             ctl.pop("creds", None)
             reply("🗑️ Saved MT5 login deleted.")
@@ -228,15 +249,17 @@ def handle(http, env, ctl, run, now, updates=None, dispatcher=None):
             except (IndexError, ValueError):
                 reply("Send a number from 0.5 to 8, e.g. <code>/goldrisk 2</code>")
         elif cmd == "/gold":
-            g = (run.get("health") or {}).get("gold")
+            src = grun if (ctl.get("gold_creds") and grun) else run
+            g = (src.get("health") or {}).get("gold")
             if not g:
                 reply("🥇 Gold not checked yet — it is read on the next trading run. Send /run.")
             else:
                 try:
-                    bal = float(str((run.get("health") or {}).get("balance", "")).lstrip("$"))
+                    bal = float(str((src.get("health") or {}).get("balance", "")).lstrip("$"))
                 except ValueError:
                     bal = None
-                reply(gold_text(g, bal) + f"\nChecked {_ago(run.get('last_run'), now)}.")
+                where = "gold account" if src is grun else "main account"
+                reply(gold_text(g, bal) + f"\nChecked {_ago(src.get('last_run'), now)} on your {where}.")
         elif cmd in ("/quiet", "/verbose"):
             ctl["verbose"] = cmd == "/verbose"
             reply("🔕 Hourly check notes off (trades, errors and the daily summary still come)." if cmd == "/quiet"
@@ -289,6 +312,7 @@ def main():
     token = env.get("MOMENTUM_TELEGRAM_TOKEN") or ""
     ctl = load_json(CONTROL_STATE, token)
     run = load_json(RUNNER_STATE, token)
+    grun = load_json(RUNNER_GOLD_STATE, token)
     deadline = time.time() + float(env.get("LISTEN_SECONDS") or 0)
     wanted = []
 
@@ -309,7 +333,7 @@ def main():
     while True:
         wait = max(0, min(25, deadline - time.time()))
         updates = fetch_updates(requests, token, ctl, wait) if token else {}
-        changed |= handle(requests, env, ctl, run, time.time(), updates=updates, dispatcher=record_dispatch)
+        changed |= handle(requests, env, ctl, run, time.time(), updates=updates, dispatcher=record_dispatch, grun=grun)
         if wanted or time.time() >= deadline or not token:
             break
     if changed:
