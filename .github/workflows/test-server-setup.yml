@@ -1,0 +1,84 @@
+# Runs deploy/setup_server.sh on fresh Ubuntu machines (same OS as a new Google Cloud server) and checks that
+# Wine, MetaTrader 5, Windows Python + MetaTrader5 package, the services and the bridge start-up all work.
+# Uses a fake MT5 account, so the bridge is expected to stop at "can't log in".
+name: Test server setup script
+
+on:
+  push:
+    branches: [main, ccr-40ef48ac-4webyc]
+    paths: ["deploy/**", ".github/workflows/test-server-setup.yml", "mt5_bridge.py"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-server-setup-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  setup:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run the setup script (non-interactive, fake account)
+        env:
+          NONINTERACTIVE: "1"
+          MT5_LOGIN: "12345678"
+          MT5_PASSWORD: "not-a-real-password"
+          MT5_SERVER: "Exness-MT5Trial9"
+          TELEGRAM_TOKEN: "000000:not-a-real-token"
+          START_SERVICES: "0"
+          BRANCH: ${{ github.ref_name }}
+        run: bash deploy/setup_server.sh
+
+      - name: Services and files are in place
+        run: |
+          set -euo pipefail
+          systemctl is-active xvfb
+          systemctl cat mt5-bridge fxalexg-bot >/dev/null
+          systemctl is-enabled mt5-bridge fxalexg-bot
+          test -f "$HOME/fxalexg_bot/.env"
+          [ "$(stat -c %a "$HOME/fxalexg_bot/.env")" = 600 ]
+          test -x "$HOME/fxalexg_bot/.venv/bin/python"
+          ls -l "$HOME/.wine_exness/drive_c/Program Files/"
+
+      - name: Windows Python can start MetaTrader 5
+        run: |
+          set -uo pipefail
+          export WINEPREFIX=$HOME/.wine_exness WINEDEBUG=-all DISPLAY=:99
+          PY="$WINEPREFIX/drive_c/Program Files/Python39/python.exe"
+          cat > /tmp/check.py <<'PY'
+          import time, MetaTrader5 as mt5
+          t0 = time.time()
+          ok = mt5.initialize(path=r"C:\Program Files\MetaTrader 5\terminal64.exe", timeout=180000)
+          print("initialize:", ok, "after", round(time.time() - t0), "s", mt5.last_error())
+          if ok:
+              ti = mt5.terminal_info()
+              print("terminal:", ti.name, "build", mt5.version(), "connected:", ti.connected, "trade_allowed:", ti.trade_allowed)
+              mt5.shutdown()
+          raise SystemExit(0 if ok else 1)
+          PY
+          timeout 300 wine "$PY" 'Z:/tmp/check.py' | tr -d '\r'
+
+      - name: Bridge starts and reaches the broker login (fake account -> login refused)
+        run: |
+          set -uo pipefail
+          export WINEPREFIX=$HOME/.wine_exness WINEDEBUG=-all DISPLAY=:99
+          wineserver -k || true
+          PY="$WINEPREFIX/drive_c/Program Files/Python39/python.exe"
+          cd "$HOME/fxalexg_bot"
+          timeout 300 wine "$PY" "Z:$HOME/fxalexg_bot/mt5_bridge.py" 2>&1 | tr -d '\r' | tee /tmp/bridge.log || true
+          grep -Eq "Attempting initial broker login|Cannot read account|MT5 Bridge Online" /tmp/bridge.log
+
+      - name: Bot unit tests in the server's Python environment
+        run: |
+          cd "$HOME/fxalexg_bot"
+          .venv/bin/python test_momentum.py
+          .venv/bin/python test_monitor.py

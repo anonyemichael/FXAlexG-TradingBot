@@ -377,6 +377,19 @@ def _revalidate_at_market(setup):
     return True
 
 
+def _max_open_for(setup):
+    trig = setup.get("trigger")
+    if trig in trend_strategy.TRIGGERS:
+        return getattr(config, "TREND_MAX_OPEN", 4)
+    if trig in swing_strategy.TRIGGERS:
+        return getattr(config, "SWING_MAX_OPEN", 3)
+    if trig == alexg_strategy.TRIGGER:
+        return getattr(config, "ALEXG_MAX_OPEN", 3)
+    if trig in momentum_strategy.TRIGGERS:
+        return getattr(config, "MOMENTUM_MAX_OPEN", 4)
+    return config.MAX_CONCURRENT
+
+
 def _method_risk_cap(setup):
     """Tighter per-method risk cap (None = global MAX_RISK_PCT)."""
     if setup.get("trigger") in momentum_strategy.TRIGGERS:
@@ -398,19 +411,39 @@ def _dispatch_setup_to_accounts(setup, side, grade, score, has_news=False, metho
         return  # accounts exist, just none assigned to this method
 
     if not active_accounts:
+        # No accounts in accounts.db (e.g. a fresh server): trade the account the bridge is logged into,
+        # with the same per-method limits the multi-account path applies.
         acc = bridge.get_account()
         bal = acc.get("balance", 0.0) if acc else 0.0
+        positions = bridge.get_positions()
+        if positions is None:
+            print(f"[{_ts()}] {symbol}: positions unreadable — skipped.")
+            return
+        if any(p["symbol"] == symbol for p in positions):
+            print(f"[{_ts()}] {symbol}: already held — skipped.")
+            return
+        max_open = _max_open_for(setup)
+        if len(positions) >= max_open:
+            print(f"[{_ts()}] {symbol}: {len(positions)} open (max {max_open}) — skipped.")
+            return
+        mom = setup.get("trigger") in momentum_strategy.TRIGGERS
         lot, risk_usd, risk_pct, warn = risk_manager.calculate_lot_size(
-            symbol, setup["sl_dist"], bal, max_risk_pct=_method_risk_cap(setup))
+            symbol, setup["sl_dist"], bal, max_risk_pct=_method_risk_cap(setup),
+            risk_pct=getattr(config, "MOMENTUM_RISK_PCT", 5.0) if mom else None)
         if not lot or lot <= 0:
             print(f"[{_ts()}] {symbol}: setup skipped by risk manager: {warn}")
-            notifier.send(f"🚫 <b>{symbol} setup skipped</b> — {warn}")
+            notifier.send(f"{'🛰️ ' if mom else ''}🚫 <b>{symbol} setup skipped</b> — {warn}")
             return
         order_res = bridge.place_order(symbol=symbol, side=side, lot=lot, sl=setup["sl"], tp=setup["tp2"], comment=f"FXAlexG {grade}")
         if order_res and "error" not in order_res:
             t = order_res.get("ticket")
             trade_logger.log_trade_opened(setup, lot, risk_usd, t, login=(acc or {}).get("login"))
-            notifier.send_trade_opened(setup, lot, risk_usd, risk_pct)
+            if mom:
+                notifier.send(f"🛰️ <b>OPENED BUY {symbol}</b> ({momentum_strategy.ENGINES[setup['trigger']]['label']})\n"
+                              f"Entry {setup['entry']:.6g} · Stop {setup['sl']:.6g} · Lots {lot}\n"
+                              f"Risk ${risk_usd:.2f} ({risk_pct}%) · Ticket #{t}")
+            else:
+                notifier.send_trade_opened(setup, lot, risk_usd, risk_pct)
         else:
             err = order_res.get("error", "no response") if order_res else "no response"
             print(f"[{_ts()}] {symbol}: order rejected by broker: {err}")
@@ -453,16 +486,7 @@ def _dispatch_setup_to_accounts(setup, side, grade, score, has_news=False, metho
                 print(f"[{_ts()}] Multi-Account: #{login} already holds {symbol} — skipped.")
                 continue
             trig = setup.get("trigger")
-            if trig in trend_strategy.TRIGGERS:
-                max_open = getattr(config, "TREND_MAX_OPEN", 4)
-            elif trig in swing_strategy.TRIGGERS:
-                max_open = getattr(config, "SWING_MAX_OPEN", 3)
-            elif trig == alexg_strategy.TRIGGER:
-                max_open = getattr(config, "ALEXG_MAX_OPEN", 3)
-            elif trig in momentum_strategy.TRIGGERS:
-                max_open = getattr(config, "MOMENTUM_MAX_OPEN", 4)
-            else:
-                max_open = config.MAX_CONCURRENT
+            max_open = _max_open_for(setup)
             is_smc = trig not in trend_strategy.TRIGGERS and trig not in swing_strategy.TRIGGERS \
                 and trig != alexg_strategy.TRIGGER and trig not in momentum_strategy.TRIGGERS
             if len(acc_pos) >= max_open:

@@ -94,6 +94,7 @@ MOMENTUM_D1_BREAK      = 20
 MOMENTUM_D1_ATR        = 3.0
 MOMENTUM_ENGINES       = ["mom_4h", "mom_d1"]
 MOMENTUM_MAX_OPEN      = 4
+MOMENTUM_RISK_PCT      = 5.0    # used when no accounts.db rows exist (per-account risk otherwise: /risk)
 MOMENTUM_MAX_RISK_PCT  = 8.0    # skip a trade if even the minimum lot would risk more than this
 MOMENTUM_MAX_SPREAD_FRAC = 0.15 # skip if the live spread is more than 15% of the stop distance
 

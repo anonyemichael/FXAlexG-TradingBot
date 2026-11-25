@@ -177,6 +177,56 @@ def test_bot_offline():
         M.closed_bars = real
 
 
+def test_bot_fresh_server_no_accounts():
+    """Fresh server, empty accounts.db: trade the bridge's own account at MOMENTUM_RISK_PCT, one per coin."""
+    import trade_logger
+    import account_manager
+    tmp = tempfile.mkdtemp()
+    trade_logger.DB_PATH = os.path.join(tmp, "trades.db")
+    account_manager.DB_PATH = os.path.join(tmp, "accounts.db")
+    import bot
+    trade_logger.init_db()
+    account_manager.init_db()
+    df4 = _breakout(_bars(300))
+    orders, sent, positions = [], [], []
+
+    class FB:
+        def get_account(self): return {"login": 333, "balance": 100.0, "equity": 100.0, "currency": "USD", "connected": True}
+        def get_positions(self): return list(positions)
+        def get_symbol_info(self, s): return {"spread": 5, "tick_size": 0.01, "tick_value": 0.01,
+                                              "volume_min": 0.01, "volume_max": 1000.0, "volume_step": 0.01}
+        def get_price(self, s): return float(df4["close"].iloc[-2])
+        def place_order(self, **k):
+            orders.append(k); positions.append({"ticket": 9, "symbol": k["symbol"], "sl": k["sl"], "volume": k["lot"]})
+            return {"ticket": 9}
+    fb = FB()
+    for name in ("get_account", "get_positions", "get_symbol_info", "get_price", "place_order"):
+        setattr(bot.bridge, name, getattr(fb, name))
+    import risk_manager
+    risk_manager.bridge = bot.bridge
+    bot.dp.get_4h = lambda symbol, count=300: df4
+    bot.dp.get_daily = lambda symbol, count=300: _btc(True)
+    bot.notifier.send = lambda *a, **k: sent.append(a[0])
+    bot.config.MOMENTUM_SYMBOLS = ["SOLUSDm"]
+    bot.config.MOMENTUM_ENGINES = ["mom_4h"]
+    real = M.closed_bars
+    M.closed_bars = lambda d, h, now=None: real(d, h, df4.index[-1] + pd.Timedelta(hours=1) if h < 24 else d.index[-1] + pd.Timedelta(hours=25))
+    bot._expected_candle = lambda engine: str(df4.index[-2])
+    try:
+        bot._mom_regime_cache.update(t=0.0, on=None)
+        bot._mom_scanned.clear()
+        bot.run_momentum_scan()
+        assert len(orders) == 1
+        t = trade_logger.get_trade_by_ticket(9)
+        assert t["login"] == 333 and t["risk_usd"] <= 100.0 * bot.config.MOMENTUM_RISK_PCT / 100 + 1e-9
+        assert any(m.startswith("🛰️") for m in sent)          # routed to the monitor bot
+        bot._mom_scanned.clear()
+        bot.run_momentum_scan()                                   # same coin already held -> no second order
+        assert len(orders) == 1
+    finally:
+        M.closed_bars = real
+
+
 if __name__ == "__main__":
     tests = [v for k, v in dict(globals()).items() if k.startswith("test_")]
     for t in tests:
