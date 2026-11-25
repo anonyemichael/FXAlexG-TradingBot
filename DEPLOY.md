@@ -10,6 +10,8 @@ You can also run it by hand: GitHub → **Actions** → *Test and deploy to VPS*
 (that button appears once this file is on the default branch; until then a push to the branch runs it).
 
 ## One-time setup
+No server yet? Follow **GOOGLE_CLOUD_SETUP.md**: a free Google Cloud server plus one command
+(`deploy/setup_server.sh`) does steps 1 and 2 below for you and prints the secrets for step 4.
 
 ### 1. VPS: make sure `.env` holds your credentials
 The deploy refuses to run unless `/home/ubuntu/fxalexg_bot/.env` contains `TELEGRAM_TOKEN=` and

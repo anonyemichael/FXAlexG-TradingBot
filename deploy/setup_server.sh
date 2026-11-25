@@ -26,7 +26,7 @@ PY_WIN_URL=https://www.python.org/ftp/python/3.9.13/python-3.9.13-amd64.exe
 MT5_URLS="https://download.mql5.com/cdn/web/exness.technologies.ltd/mt5/exness5setup.exe
 https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe"
 
-log() { printf '\n\033[1;36m== %s\033[0m\n' "$*"; }
+log() { printf '\n\033[1;36m== [%s] %s\033[0m\n' "$(date +%H:%M:%S)" "$*"; }
 die() { printf '\n\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" -ne 0 ] || die "Run this as your normal user, not root (it uses sudo where needed)."
@@ -144,10 +144,10 @@ trap 'rm -rf "$TMP"' EXIT
 # ── 6. Wine prefix (Windows 10 mode) ─────────────────────────────────────────
 if [ ! -f "$PREFIX/system.reg" ]; then
   log "Creating the Wine environment in $PREFIX"
-  wineboot --init >/dev/null 2>&1 || true
-  wineserver -w || true
-  wine winecfg -v win10 >/dev/null 2>&1 || true
-  wineserver -w || true
+  timeout 300 wineboot --init >/dev/null 2>&1 || true
+  timeout 120 wineserver -w || true
+  timeout 120 wine winecfg -v win10 >/dev/null 2>&1 || true
+  timeout 120 wineserver -w || true
 fi
 
 # ── 7. MetaTrader 5 ──────────────────────────────────────────────────────────
@@ -182,13 +182,13 @@ WINPY="$PREFIX/drive_c/Program Files/Python39/python.exe"
 if [ ! -f "$WINPY" ]; then
   log "Installing Windows Python 3.9 inside Wine"
   wget -qO "$TMP/python.exe" "$PY_WIN_URL"
-  wine "$TMP/python.exe" /quiet InstallAllUsers=1 PrependPath=1 Include_test=0 Include_doc=0 Include_tcltk=0 >/dev/null 2>&1 || true
-  wineserver -w || true
+  timeout 900 wine "$TMP/python.exe" /quiet InstallAllUsers=1 PrependPath=1 Include_test=0 Include_doc=0 Include_tcltk=0 >/dev/null 2>&1 || true
+  timeout 120 wineserver -w || true
   [ -f "$WINPY" ] || die "Windows Python did not install"
 fi
 log "Installing the MetaTrader5 Python package"
-wine "$WINPY" -m pip install -q --disable-pip-version-check --upgrade pip >/dev/null 2>&1 || true
-wine "$WINPY" -m pip install -q --disable-pip-version-check MetaTrader5 >/dev/null 2>&1 || true
+timeout 600 wine "$WINPY" -m pip install -q --disable-pip-version-check --upgrade pip >/dev/null 2>&1 || true
+timeout 900 wine "$WINPY" -m pip install -q --disable-pip-version-check MetaTrader5 >/dev/null 2>&1 || true
 wine "$WINPY" -c "import MetaTrader5 as m; print('MetaTrader5 package', m.__version__)" 2>/dev/null | tr -d '\r' \
   || die "MetaTrader5 package not importable in Wine Python"
 

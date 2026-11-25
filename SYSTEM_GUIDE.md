@@ -130,6 +130,7 @@ Every trade message starts with the bot that took it: **📈 Crypto Trend · #lo
 | Bridge log | `sudo journalctl -u mt5-bridge -n 100` |
 | Restart bot | `sudo systemctl restart fxalexg-bot` |
 | Deploy new code | push to GitHub: Actions tests, copies the code, restarts, rolls back on failure (DEPLOY.md) |
+| New server from scratch | GOOGLE_CLOUD_SETUP.md → `bash deploy/setup_server.sh` (Wine, MT5, bridge, bot, services) |
 | Roll back | `cp -a /home/ubuntu/fxalexg_bot_backup_20261103/. /home/ubuntu/fxalexg_bot/` then restart |
 | Research | `cd /home/ubuntu/research && python3 trend_research.py data` |
 
