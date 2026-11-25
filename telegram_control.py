@@ -50,6 +50,7 @@ def log_text(run, now):
             + "\n".join(lines[-40:]))
 
 
+HOURLY_SECONDS = 55 * 60     # start a trading check when the last one is older than this
 AUTO_TEST = 2                # bump to make the listener run /testtrade once more by itself
 
 
@@ -276,6 +277,12 @@ def main():
         return True
 
     changed = False
+    hourly = False
+    # GitHub's cron is unreliable, so the always-on listener also starts the hourly trading check itself
+    if token and time.time() - float(run.get("last_run") or 0) > HOURLY_SECONDS \
+            and time.time() - ctl.get("last_dispatch", 0) > 900:
+        record_dispatch()
+        hourly = changed = True
     while True:
         wait = max(0, min(25, deadline - time.time()))
         updates = fetch_updates(requests, token, ctl, wait) if token else {}
@@ -287,9 +294,10 @@ def main():
     out = env.get("GITHUB_OUTPUT")
     if out:
         with open(out, "a") as f:
-            f.write(f"changed={'true' if changed else 'false'}\ndispatch={'true' if wanted else 'false'}\n")
+            f.write(f"changed={'true' if changed else 'false'}\ndispatch={'true' if wanted else 'false'}\n"
+                    f"hourly={'true' if hourly else 'false'}\n")
     print(f"Telegram check done ({'state changed' if changed else 'no changes'}"
-          f"{', starting a trading run' if wanted else ''}).")
+          f"{', starting the hourly check' if hourly else ', starting a trading run' if wanted else ''}).")
     return 0
 
 

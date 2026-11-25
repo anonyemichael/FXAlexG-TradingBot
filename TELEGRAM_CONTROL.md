@@ -17,21 +17,21 @@ GitHub's cache, encrypted with your bot token, so nothing readable is stored in 
 ## Commands
 | Command | What it does | Reply time |
 |---|---|---|
-| `/help` | list of commands | ~5 min |
-| `/settings` | risk, coins, paused or not, login in use | ~5 min |
-| `/pause` · `/resume` | stop / allow new trades (open trades keep being managed) | ~5 min |
-| `/risk 3` | risk per trade in % (0.5–10; the 8% per-trade cap still applies) | ~5 min |
-| `/log` | what the last trading run did, line by line | ~5 min |
-| `/health` | last run, MT5 login, Algo Trading, last error | ~5 min |
-| `/filter` | Bitcoin trend filter (on = trading allowed) | ~5 min |
-| `/quiet` · `/verbose` | turn the hourly "checked, nothing new" note off / on | ~5 min |
-| `/status` | live balance, open trades, P&L | ~8 min |
-| `/trades` | last 10 closed trades | ~8 min |
-| `/run` | check for new trades now | ~8 min |
-| `/testtrade` | smallest possible trade on the cheapest coin, opened and closed at once (proves orders reach MT5; costs a few cents of spread) | ~8 min |
-| `/close SOLUSD` | close one trade at market | ~8 min |
-| `/closeall confirm` | close every momentum trade at market | ~8 min |
-| `/login …` · `/logout` | save / delete the MT5 login | ~5 min |
+| `/help` | list of commands | seconds to ~1 min |
+| `/settings` | risk, coins, paused or not, login in use | seconds to ~1 min |
+| `/pause` · `/resume` | stop / allow new trades (open trades keep being managed) | seconds to ~1 min |
+| `/risk 3` | risk per trade in % (0.5–10; the 8% per-trade cap still applies) | seconds to ~1 min |
+| `/log` | what the last trading run did, line by line | seconds to ~1 min |
+| `/health` | last run, MT5 login, Algo Trading, last error | seconds to ~1 min |
+| `/filter` | Bitcoin trend filter (on = trading allowed) | seconds to ~1 min |
+| `/quiet` · `/verbose` | turn the hourly "checked, nothing new" note off / on | seconds to ~1 min |
+| `/status` | live balance, open trades, P&L | ~3 min |
+| `/trades` | last 10 closed trades | ~3 min |
+| `/run` | check for new trades now | ~3 min |
+| `/testtrade` | smallest possible trade on the cheapest coin, opened and closed at once (proves orders reach MT5; costs a few cents of spread) | ~3 min |
+| `/close SOLUSD` | close one trade at market | ~3 min |
+| `/closeall confirm` | close every momentum trade at market | ~3 min |
+| `/login …` · `/logout` | save / delete the MT5 login | seconds to ~1 min |
 
 You also get, without asking: every buy (with the reason: breakout level, Bitcoin filter, stop distance),
 every stop raise and close with P&L, filter on/off changes, errors, a one-line note after each hourly check

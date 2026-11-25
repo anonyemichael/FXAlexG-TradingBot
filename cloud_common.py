@@ -62,7 +62,7 @@ def tg_send(http, token, chat, text):
 
 HELP = (
     "🛰️ <b>Momentum bot — Telegram control</b>\n"
-    "<b>Instant</b> (answered within ~5 min):\n"
+    "<b>Instant</b> (answered within a minute):\n"
     "/settings — risk, coins, paused or not\n"
     "/pause · /resume — stop/allow new trades (open trades are still managed)\n"
     "/risk 3 — risk per trade in % (0.5–10)\n"

@@ -1,6 +1,8 @@
-# Telegram listener for the GitHub-hosted momentum bot (telegram_control.py). Every 5 minutes it reads your
-# Telegram messages, answers settings/log/health/filter/pause/resume/risk/login at once, and starts the
-# trading workflow (cloud-bot.yml) right away for /status /trades /run /close /closeall.
+# Telegram listener for the GitHub-hosted momentum bot (telegram_control.py). It reads your Telegram messages,
+# answers settings/log/health/filter/pause/resume/risk/login at once, starts the trading workflow
+# (cloud-bot.yml) right away for /status /trades /run /close /closeall /testtrade, and starts the hourly check.
+# Always on: each run starts the next one at the end (GitHub's cron alone fired nothing for hours; it stays as
+# a backup that restarts the chain). To stop the chain: repository variable LISTENER_CHAIN = off.
 # Needs the MOMENTUM_TELEGRAM_TOKEN secret. Runs from the default branch (main).
 name: Telegram control
 
@@ -73,7 +75,9 @@ jobs:
         if: steps.tg.outputs.dispatch == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run cloud-bot.yml -R "${{ github.repository }}" --ref "${{ github.event.repository.default_branch || 'main' }}" -f mode=live
+        run: |
+          gh workflow run cloud-bot.yml -R "${{ github.repository }}" --ref "${{ github.event.repository.default_branch || 'main' }}" \
+            -f mode=live -f hourly=${{ steps.tg.outputs.hourly || 'false' }}
 
       - name: Remove old copies (keep the newest 3)
         if: steps.tg.outputs.changed == 'true'
@@ -82,3 +86,15 @@ jobs:
         run: |
           gh cache list -R "${{ github.repository }}" --key cloud-ctl- --sort created_at --order desc --limit 100 \
             --json id --jq '.[3:][].id' | xargs -r -n1 gh cache delete -R "${{ github.repository }}" >/dev/null 2>&1 || true
+
+      - name: Keep listening (start the next listener run)
+        if: ${{ !cancelled() && vars.LISTENER_CHAIN != 'off' && github.ref_name == (github.event.repository.default_branch || 'main') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OUTCOME: ${{ steps.tg.outcome }}
+        run: |
+          if [ "$OUTCOME" != "success" ]; then sleep 240; fi      # never spin fast if something is broken
+          for i in 1 2 3; do
+            gh workflow run telegram-control.yml -R "${{ github.repository }}" --ref "${{ github.ref_name }}" && break
+            sleep 15
+          done

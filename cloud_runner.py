@@ -538,7 +538,8 @@ def run(mt5, env, state, control=None, http=requests, now=None):
                 state["summary_day"] = now.strftime("%Y-%m-%d")       # that was today's summary
         if events:
             notify("\n\n".join(events))
-        elif env.get("GITHUB_EVENT_NAME") == "schedule" and control.get("verbose", True):
+        elif (env.get("GITHUB_EVENT_NAME") == "schedule" or env.get("HOURLY_CHECK") == "true") \
+                and control.get("verbose", True):
             why = ("paused by you" if control.get("paused") else
                    "no breakouts" if on else "BTC filter off, waiting")
             notify(f"🕐 {now:%H:%M} UTC check — {health['open']} open trade(s), no new trades ({why}). "

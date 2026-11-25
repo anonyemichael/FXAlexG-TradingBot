@@ -1,7 +1,8 @@
 # Momentum Breakout bot running on GitHub itself (no VPS): once an hour a Windows machine installs MT5,
 # logs in, runs cloud_runner.py (manage trades, new breakouts, Telegram) and shuts down.
 #
-# Telegram control: telegram-control.yml (every 5 min) answers your commands and starts this workflow on demand.
+# Telegram control: telegram-control.yml answers your commands, starts this workflow on demand and, because
+# GitHub's cron is unreliable, also starts the hourly check itself (hourly=true). The cron below is a backup.
 # MT5 login: send it to the Telegram bot as  /login <account> <password> [server]  (stored encrypted),
 # or set secrets (Settings -> Secrets and variables -> Actions):
 #   MT5_LOGIN, MT5_PASSWORD             optional when /login is used
@@ -24,6 +25,10 @@ on:
         type: choice
         options: [live, dry]
         default: live
+      hourly:
+        description: "the regular hourly check (started by the Telegram listener)"
+        type: boolean
+        default: false
   push:
     branches: [main, ccr-40ef48ac-4webyc]
     paths: ["cloud_runner.py", "cloud_common.py", "momentum_strategy.py", "config.py", ".github/workflows/cloud-bot.yml"]
@@ -108,6 +113,7 @@ jobs:
           MOMENTUM_TELEGRAM_CHAT_ID: ${{ secrets.MOMENTUM_TELEGRAM_CHAT_ID }}
           MOMENTUM_RISK_PCT: ${{ vars.MOMENTUM_RISK_PCT || '5' }}
           MT5_PORTABLE: "1"
+          HOURLY_CHECK: ${{ inputs.hourly && 'true' || 'false' }}
           TELEGRAM_TOKEN: ""
           PYTHONIOENCODING: utf-8
         run: python cloud_runner.py

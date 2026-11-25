@@ -299,6 +299,10 @@ def test_hourly_note_and_quiet():
     assert any("UTC check" in t and "BTC filter off" in t for t in http.sent)
     _, _, http, _ = _run(FakeMT5(btc_up=False), env, control={"verbose": False})
     assert not any("UTC check" in t for t in http.sent)
+    _, _, http, _ = _run(FakeMT5(btc_up=False), {**ENV, "HOURLY_CHECK": "true"})
+    assert any("UTC check" in t for t in http.sent)                 # hourly run started by the listener
+    _, _, http, _ = _run(FakeMT5(btc_up=False))
+    assert not any("UTC check" in t for t in http.sent)             # on-demand runs don't add the note
 
 
 def test_buy_message_explains_why():

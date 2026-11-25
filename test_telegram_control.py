@@ -177,6 +177,33 @@ def test_main_saves_before_dispatch():
     assert saved["creds"]["login"] == "436015341" and b"Pass@1" not in open(T.CONTROL_STATE, "rb").read()
 
 
+def _main(run_state, updates=(), last_dispatch=0):
+    import tempfile
+    from cloud_common import save_json
+    d = tempfile.mkdtemp()
+    T.CONTROL_STATE, T.RUNNER_STATE = os.path.join(d, "ctl.json"), os.path.join(d, "run.json")
+    save_json(T.CONTROL_STATE, {"tg_chat": "777", "hello_sent": True, "auto_test_done": T.AUTO_TEST,
+                                "last_dispatch": last_dispatch}, "tok")
+    save_json(T.RUNNER_STATE, run_state, "tok")
+    out = os.path.join(d, "out.txt")
+    T.requests = FakeHTTP(list(updates))
+    old = dict(os.environ)
+    os.environ.update({"MOMENTUM_TELEGRAM_TOKEN": "tok", "LISTEN_SECONDS": "0", "GITHUB_OUTPUT": out})
+    try:
+        T.main()
+    finally:
+        os.environ.clear(); os.environ.update(old)
+    return open(out).read()
+
+
+def test_listener_starts_the_hourly_check_itself():
+    import time
+    assert "hourly=true" in _main({"last_run": time.time() - 2 * 3600})
+    out = _main({"last_run": time.time() - 600})
+    assert "dispatch=false" in out and "hourly=false" in out
+    assert "hourly=false" in _main({"last_run": time.time() - 2 * 3600}, last_dispatch=time.time() - 300)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in dict(globals()).items() if k.startswith("test_")]
     for t in tests:
