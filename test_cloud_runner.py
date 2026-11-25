@@ -232,6 +232,30 @@ def test_telegram_requests_answered_once():
     assert not any("status" in t.lower() and "Daily" not in t for t in http.sent[n:])
 
 
+def test_testtrade_opens_and_closes_smallest_position():
+    mt5 = FakeMT5(breakout=False)
+    control = {"requests": [{"id": 5, "cmd": "testtrade", "arg": "", "ts": 0}]}
+    code, state, http, out = _run(mt5, control=control)
+    assert len(mt5.orders) == 1 and mt5.orders[0]["magic"] == C.MAGIC_TEST and mt5.orders[0]["volume"] == 0.01
+    assert len(mt5.closes) == 1 and mt5.closes[0]["magic"] == C.MAGIC_TEST
+    assert any("MT5 test trade worked" in t for t in http.sent) and 5 in state["done"]
+    assert not C.Broker(mt5).positions()                    # test trade never counts as a momentum trade
+
+
+def test_hourly_note_and_quiet():
+    env = {**ENV, "GITHUB_EVENT_NAME": "schedule"}
+    _, _, http, _ = _run(FakeMT5(btc_up=False), env)
+    assert any("UTC check" in t and "BTC filter off" in t for t in http.sent)
+    _, _, http, _ = _run(FakeMT5(btc_up=False), env, control={"verbose": False})
+    assert not any("UTC check" in t for t in http.sent)
+
+
+def test_buy_message_explains_why():
+    _, _, http, _ = _run(FakeMT5())
+    buy = next(t for t in http.sent if "BUY SOLUSDm" in t)
+    assert "Why:" in buy and "42-candle high" in buy and "BTC above" in buy
+
+
 def test_state_is_encrypted_at_rest():
     import tempfile
     from cloud_common import load_json, save_json

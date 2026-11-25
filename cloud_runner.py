@@ -30,6 +30,7 @@ import momentum_strategy as M
 from cloud_common import CONTROL_STATE, DEFAULT_SERVER, RUNNER_STATE, load_json, save_json, tg_send
 
 MAGIC = 26112501
+MAGIC_TEST = MAGIC + 1        # /testtrade positions (opened and closed in the same run)
 COMMENT = {"mom_4h": "MOM 4H", "mom_d1": "MOM D1"}
 
 
@@ -109,11 +110,11 @@ class Broker:
         return ok, (res.retcode if res is not None else None), (getattr(res, "comment", "") if res is not None else
                                                                  str(self.mt5.last_error()))
 
-    def buy(self, symbol, lot, sl, comment):
+    def buy(self, symbol, lot, sl, comment, magic=MAGIC):
         info, tick = self.mt5.symbol_info(symbol), self.mt5.symbol_info_tick(symbol)
         return self._send({"action": self.mt5.TRADE_ACTION_DEAL, "symbol": symbol, "volume": lot,
                            "type": self.mt5.ORDER_TYPE_BUY, "price": tick.ask, "sl": round(sl, info.digits),
-                           "tp": 0.0, "deviation": 50, "magic": MAGIC, "comment": comment,
+                           "tp": 0.0, "deviation": 50, "magic": magic, "comment": comment,
                            "type_time": self.mt5.ORDER_TIME_GTC, "type_filling": self._filling(info)})
 
     def modify_sl(self, pos, sl):
@@ -125,7 +126,7 @@ class Broker:
         info, tick = self.mt5.symbol_info(pos.symbol), self.mt5.symbol_info_tick(pos.symbol)
         return self._send({"action": self.mt5.TRADE_ACTION_DEAL, "symbol": pos.symbol, "volume": pos.volume,
                            "type": self.mt5.ORDER_TYPE_SELL, "position": pos.ticket, "price": tick.bid,
-                           "deviation": 50, "magic": MAGIC, "comment": "MOM exit",
+                           "deviation": 50, "magic": getattr(pos, "magic", MAGIC), "comment": "MOM exit",
                            "type_time": self.mt5.ORDER_TIME_GTC, "type_filling": self._filling(info)})
 
 
@@ -168,6 +169,35 @@ def filter_text(btc_d, now):
     txt += ("Breakouts are being traded." if on else
             f"No new buys until BTC closes above ~{ema:,.0f} (+{(ema / last - 1) * 100:.1f}%).")
     return txt
+
+
+def test_trade(mt5, br, syms, note):
+    """Open the smallest possible position on the cheapest available coin and close it straight away,
+    to prove orders really execute. Returns the Telegram text."""
+    best = None
+    for sym in [s for s in syms.values() if s]:
+        info, tick = mt5.symbol_info(sym), mt5.symbol_info_tick(sym)
+        if not info or not tick:
+            continue
+        notional = info.volume_min * getattr(info, "trade_contract_size", 1.0) * tick.ask
+        if best is None or notional < best[0]:
+            best = (notional, sym, info, tick)
+    if not best:
+        return "❌ Test trade: none of the coins is available on this account."
+    _, sym, info, tick = best
+    ok, code, msg = br.buy(sym, info.volume_min, tick.ask * 0.95, "TEST", magic=MAGIC_TEST)
+    note(f"Test trade BUY {sym} {info.volume_min}: {'ok' if ok else f'FAILED {code} {msg}'}")
+    if not ok:
+        return (f"❌ <b>Test trade failed</b> on {sym}: broker said {code} {msg}.\n"
+                "Common causes: 10027 = Algo Trading off, 10018 = market closed, 10019 = not enough money.")
+    pos = next((p for p in (mt5.positions_get() or []) if p.magic == MAGIC_TEST and p.symbol == sym), None)
+    if pos is None:
+        return f"⚠️ Test BUY {sym} was accepted but no open position was found. Check MT5."
+    ok2, code2, msg2 = br.close(pos)
+    note(f"Test trade CLOSE {sym}: {'ok' if ok2 else f'FAILED {code2} {msg2}'}")
+    return (f"✅ <b>MT5 test trade worked</b>\nBought {info.volume_min} lot {sym} at ~{tick.ask:.6g} "
+            f"(ticket #{pos.ticket}) and {'closed it again' if ok2 else f'could NOT close it ({code2} {msg2}) — close it in MT5'}.\n"
+            "Cost: about one spread. The bot can place and close real orders on your account.")
 
 
 def run(mt5, env, state, control=None, http=requests, now=None):
@@ -275,6 +305,8 @@ def run(mt5, env, state, control=None, http=requests, now=None):
             ps = br.positions()
             res = [close_pos(p, "close all")[0] for p in ps]
             notify(f"✅ Closed {sum(res)} of {len(ps)} momentum trades." if ps else "🛰️ No open momentum trades.")
+        elif r["cmd"] == "testtrade" and live:
+            notify(test_trade(mt5, br, syms, note))
 
     # 2. manage open trades
     for pos in br.positions():
@@ -350,8 +382,10 @@ def run(mt5, env, state, control=None, http=requests, now=None):
                 note(f"BUY {sym} {lot} lot, stop {sl:.6g}, risk ${risk_usd:.2f}: {'ok' if ok_ else f'REJECTED {code} {msg}'}")
                 if ok_:
                     entries += 1
-                    events.append(f"🟢 <b>BUY {sym}</b> ({label} breakout)\nEntry ~{tick.ask:.6g} · Stop {sl:.6g} · "
-                                  f"Lots {lot}\nRisk ${risk_usd:.2f} ({risk_usd / balance * 100:.1f}%)")
+                    events.append(f"🟢 <b>BUY {sym}</b> ({label} breakout)\nEntry ~{tick.ask:.6g} · Stop {sl:.6g} "
+                                  f"({setup['sl_dist'] / tick.ask * 100:.1f}% away, trails up) · Lots {lot}\n"
+                                  f"Risk ${risk_usd:.2f} ({risk_usd / balance * 100:.1f}% of ${balance:.2f})\n"
+                                  f"Why: {setup['met'][1]}; {setup['met'][0]}")
                 else:
                     events.append(f"❌ {sym} order rejected ({code} {msg})")
     log(f"Checked {sum(1 for s in syms.values() if s)} symbols; {entries} new entr{'y' if entries == 1 else 'ies'}.")
@@ -396,6 +430,11 @@ def run(mt5, env, state, control=None, http=requests, now=None):
             notify(f"✅ <b>Logged in to MT5</b> ({login} on {server}).\n\n" + status())
         if events:
             notify("\n\n".join(events))
+        elif env.get("GITHUB_EVENT_NAME") == "schedule" and control.get("verbose", True):
+            why = ("paused by you" if control.get("paused") else
+                   "no breakouts" if on else "BTC filter off, waiting")
+            notify(f"🕐 {now:%H:%M} UTC check — {health['open']} open trade(s), no new trades ({why}). "
+                   f"Balance ${balance:.2f}. /quiet to stop these notes.")
         today = now.strftime("%Y-%m-%d")
         if now.hour >= getattr(config, "MONITOR_DAILY_HOUR", 7) and state.get("summary_day") != today:
             if notify("☀️ <b>Daily summary</b>\n\n" + status()):

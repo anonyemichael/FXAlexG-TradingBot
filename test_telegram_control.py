@@ -49,6 +49,7 @@ def _go(updates, ctl=None, run=None, env=ENV, now=NOW, http=None, owner=None, he
     ctl = {} if ctl is None else ctl
     if not hello:
         ctl.setdefault("hello_sent", True)
+        ctl.setdefault("auto_test_done", True)
     http = http or FakeHTTP(updates)
     if updates and http.updates == []:
         http.updates = list(updates)
@@ -63,6 +64,8 @@ def texts(http):
 def test_hello_to_owner_once():
     _, ctl, http = _go([], {}, owner="6220850396", hello=True)
     assert http.sent and http.sent[0][0] == "6220850396" and "Momentum bot connected" in http.sent[0][1]
+    assert [r["cmd"] for r in ctl["requests"]] == ["testtrade"] and http.dispatches   # one-time test trade
+    assert any("test trade" in t for _, t in http.sent)
     assert ctl["hello_sent"] and ctl["tg_chat"] == "6220850396"
     _, ctl, http = _go([msg(1, 555, "/start")], ctl, owner="6220850396")   # stranger can't take over
     assert not http.sent and ctl["tg_chat"] == "6220850396"
@@ -136,6 +139,13 @@ def test_dispatch_failure_is_reported():
     http = FakeHTTP([msg(1, 777, "/status")], dispatch_status=403)
     _, ctl, http = _go([], {"tg_chat": "777"}, http=http)
     assert any("Couldn't start a run" in t for t in texts(http))
+
+
+def test_quiet_verbose_and_testtrade():
+    _, ctl, http = _go([msg(1, 777, "/quiet")], {"tg_chat": "777"})
+    assert ctl["verbose"] is False and "off" in texts(http)[0]
+    _, ctl, http = _go([msg(2, 777, "/verbose"), msg(3, 777, "/testtrade")], ctl, now=NOW + 300)
+    assert ctl["verbose"] is True and ctl["requests"][-1]["cmd"] == "testtrade" and http.dispatches
 
 
 def test_main_saves_before_dispatch():

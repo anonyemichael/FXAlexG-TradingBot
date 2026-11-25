@@ -69,10 +69,12 @@ HELP = (
     "/log — what the last run did\n"
     "/health — last run, login, errors\n"
     "/filter — Bitcoin trend filter\n"
+    "/quiet · /verbose — hourly check notes off/on\n"
     "/login ACCOUNT PASSWORD SERVER · /logout\n"
     "<b>Live from MT5</b> (starts a run, reply in ~3 min):\n"
     "/status — balance, open trades, P&amp;L\n"
     "/trades — last 10 closed trades\n"
     "/run — check for trades right now\n"
+    "/testtrade — tiny trade opened and closed at once, to prove MT5 orders work\n"
     "/close SOLUSD — close one trade · /closeall confirm — close all"
 )

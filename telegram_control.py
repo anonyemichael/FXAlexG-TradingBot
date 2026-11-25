@@ -18,7 +18,7 @@ import requests
 import config
 from cloud_common import CONTROL_STATE, DEFAULT_SERVER, HELP, RUNNER_STATE, load_json, save_json, tg_send
 
-LIVE_CMDS = {"/status": "status", "/trades": "trades", "/run": "run"}
+LIVE_CMDS = {"/status": "status", "/trades": "trades", "/run": "run", "/testtrade": "testtrade"}
 
 
 def _ago(ts, now):
@@ -36,6 +36,7 @@ def settings_text(ctl):
             f"New trades: <b>{'PAUSED ⏸️' if ctl.get('paused') else 'ON ▶️'}</b>\n"
             f"Risk per trade: <b>{risk:g}%</b> (never above {getattr(config, 'MOMENTUM_MAX_RISK_PCT', 8.0):g}%)\n"
             f"Max open trades: {getattr(config, 'MOMENTUM_MAX_OPEN', 4)}\n"
+            f"Hourly check notes: {'on' if ctl.get('verbose', True) else 'off'}\n"
             f"Coins: {coins}\n"
             f"Engines: 4H + Daily breakouts, BTC EMA{getattr(config, 'MOMENTUM_REGIME_EMA', 100)} filter\n"
             f"MT5 login: {('account ' + str(login.get('login')) + ' on ' + str(login.get('server'))) if login else 'GitHub secrets or not set'}")
@@ -150,6 +151,13 @@ def handle(http, env, ctl, run, now, updates=None, dispatcher=None):
         print(f"Telegram refused the token: {updates.get('description', 'unknown error')}")
     if updates.get("result"):
         print(f"Telegram messages received: {len(updates['result'])}")
+    if chat and ctl.get("hello_sent") and not ctl.get("auto_test_done"):
+        # one-time check after setup: a tiny trade opened and closed at once proves MT5 orders execute
+        ctl["auto_test_done"] = True
+        queue("testtrade")
+        need_run = True
+        reply("🧪 Running a one-time test trade (smallest size, opened and closed at once) to prove "
+              "orders reach MT5. Result in ~3 minutes.")
     for u in updates.get("result", []):
         ctl["tg_offset"] = u["update_id"] + 1
         msg = u.get("message") or u.get("edited_message") or {}
@@ -200,6 +208,10 @@ def handle(http, env, ctl, run, now, updates=None, dispatcher=None):
                 reply(f"✅ Risk per trade set to <b>{v:g}%</b> from the next trade.")
             except (IndexError, ValueError):
                 reply("Send a number from 0.5 to 10, e.g. <code>/risk 3</code>")
+        elif cmd in ("/quiet", "/verbose"):
+            ctl["verbose"] = cmd == "/verbose"
+            reply("🔕 Hourly check notes off (trades, errors and the daily summary still come)." if cmd == "/quiet"
+                  else "🔔 Hourly check notes on: you'll hear from me after every hourly check.")
         elif cmd == "/settings":
             reply(settings_text(ctl))
         elif cmd == "/log":
