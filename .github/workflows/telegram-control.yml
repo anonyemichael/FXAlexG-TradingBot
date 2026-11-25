@@ -1,0 +1,74 @@
+# Telegram listener for the GitHub-hosted momentum bot (telegram_control.py). Every 5 minutes it reads your
+# Telegram messages, answers settings/log/health/filter/pause/resume/risk/login at once, and starts the
+# trading workflow (cloud-bot.yml) right away for /status /trades /run /close /closeall.
+# Needs the MOMENTUM_TELEGRAM_TOKEN secret. Runs from the default branch (main).
+name: Telegram control
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write      # start cloud-bot.yml on demand, tidy old cache entries
+
+concurrency:
+  group: telegram-control
+  cancel-in-progress: false
+
+jobs:
+  listen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Python packages
+        run: pip install --quiet --disable-pip-version-check requests cryptography
+
+      - name: Restore Telegram settings
+        uses: actions/cache/restore@v4
+        with:
+          path: cloud_ctl
+          key: cloud-ctl-none
+          restore-keys: cloud-ctl-
+          enableCrossOsArchive: true
+
+      - name: Restore last trading run (for /log /health /filter)
+        uses: actions/cache/restore@v4
+        with:
+          path: cloud_state
+          key: cloud-runner-none
+          restore-keys: cloud-runner-
+          enableCrossOsArchive: true
+
+      - name: Read Telegram and answer
+        id: tg
+        env:
+          MOMENTUM_TELEGRAM_TOKEN: ${{ secrets.MOMENTUM_TELEGRAM_TOKEN }}
+          MOMENTUM_TELEGRAM_CHAT_ID: ${{ secrets.MOMENTUM_TELEGRAM_CHAT_ID }}
+          GITHUB_TOKEN: ${{ github.token }}
+          DISPATCH_REF: ${{ github.event.repository.default_branch }}
+          TELEGRAM_TOKEN: ""
+        run: python telegram_control.py
+
+      - name: Save Telegram settings
+        if: steps.tg.outputs.changed == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: cloud_ctl
+          key: cloud-ctl-${{ github.run_id }}-${{ github.run_attempt }}
+          enableCrossOsArchive: true
+
+      - name: Remove old copies (keep the newest 3)
+        if: steps.tg.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh cache list -R "${{ github.repository }}" --key cloud-ctl- --sort created_at --order desc --limit 100 \
+            --json id --jq '.[3:][].id' | xargs -r -n1 gh cache delete -R "${{ github.repository }}" >/dev/null 2>&1 || true

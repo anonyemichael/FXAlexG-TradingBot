@@ -1,23 +1,21 @@
 """
-Momentum Breakout bot on GitHub Actions — no VPS.
+Momentum Breakout bot on GitHub Actions — no VPS. The trading half; telegram_control.py is the Telegram half.
 
-Every hour a GitHub Windows machine installs MetaTrader 5, logs in, and runs this once:
-  1. manage open momentum trades (raise trailing stops; close daily-engine trades when the BTC filter turns off)
-  2. report trades that closed since the last run
-  3. look for new breakouts and buy (same rules as momentum_strategy.py on the VPS bot)
-  4. answer Telegram commands (/status /trades /filter /help) and send a daily summary
-then exits. State (Telegram chat/offset, last run, filter status) is kept in the Actions cache.
+Each run (hourly, or right away when you ask in Telegram) a GitHub Windows machine installs MetaTrader 5,
+logs in, and runs this once:
+  1. answer queued Telegram requests (/status /trades /close /closeall /run)
+  2. manage open momentum trades (raise trailing stops; close daily-engine trades when the BTC filter turns off)
+  3. report trades that closed since the last run
+  4. buy new breakouts (same momentum_strategy.py rules as the VPS bot) unless you sent /pause
+  5. save a private run log (/log), health (/health) and the filter (/filter); daily summary at 07:00 UTC
 
-The repository is public, so Actions logs are public: this script never prints the account number,
-balance, prices or trades. Those go to Telegram only.
+Public repo => public Actions logs: this script prints no account numbers, balances, prices or trades.
+Details go to Telegram and into the encrypted state (cloud_common.py).
 
-MT5 login: GitHub secrets MT5_LOGIN / MT5_PASSWORD / MT5_SERVER, or sent in Telegram as
-  /login <account> <password> [server]  (stored encrypted in the Actions cache; the message is deleted).
-Env: MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, MT5_PATH (terminal64.exe), MOMENTUM_TELEGRAM_TOKEN,
-     MOMENTUM_TELEGRAM_CHAT_ID (optional), MOMENTUM_RISK_PCT (default 5), MODE=live|dry, CLOUD_STATE (state file)
+MT5 login: /login in Telegram (stored encrypted), or GitHub secrets MT5_LOGIN / MT5_PASSWORD / MT5_SERVER.
+Env: MT5_PATH, MT5_PORTABLE, MOMENTUM_TELEGRAM_TOKEN, MOMENTUM_TELEGRAM_CHAT_ID, MOMENTUM_RISK_PCT, MODE=live|dry
 """
 
-import json
 import math
 import os
 import sys
@@ -29,108 +27,15 @@ import requests
 
 import config
 import momentum_strategy as M
+from cloud_common import CONTROL_STATE, DEFAULT_SERVER, RUNNER_STATE, load_json, save_json, tg_send
 
 MAGIC = 26112501
 COMMENT = {"mom_4h": "MOM 4H", "mom_d1": "MOM D1"}
-STATE_PATH = os.environ.get("CLOUD_STATE", os.path.join("cloud_state", "state.json"))
 
 
 def log(msg):
     """Public log line: never pass account data, prices or balances here."""
     print(f"[{datetime.now(timezone.utc):%H:%M:%S}] {msg}", flush=True)
-
-
-def load_state():
-    try:
-        with open(STATE_PATH) as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def save_state(st):
-    os.makedirs(os.path.dirname(STATE_PATH) or ".", exist_ok=True)
-    with open(STATE_PATH, "w") as f:
-        json.dump(st, f)
-
-
-# ── Telegram ───────────────────────────────────────────────────────────────────
-
-class Telegram:
-    def __init__(self, token, chat_id, state, http=requests):
-        self.token, self.state, self.http = token or "", state, http
-        self.chat = str(chat_id or state.get("tg_chat") or "") or None
-
-    def send(self, text):
-        if not self.token or not self.chat:
-            return False
-        try:
-            r = self.http.post(f"https://api.telegram.org/bot{self.token}/sendMessage",
-                               json={"chat_id": self.chat, "text": text, "parse_mode": "HTML",
-                                     "disable_web_page_preview": True}, timeout=15)
-            return r.status_code == 200
-        except Exception:
-            return False
-
-    def delete(self, message_id):
-        try:
-            self.http.post(f"https://api.telegram.org/bot{self.token}/deleteMessage",
-                           json={"chat_id": self.chat, "message_id": message_id}, timeout=15)
-        except Exception:
-            pass
-
-    def commands(self):
-        """New commands from the owner chat: [{"cmd", "text", "mid"}]. The first /start (or /login) claims the
-        bot when no chat id is configured; anyone else is ignored."""
-        if not self.token:
-            return []
-        params = {"timeout": 0}
-        if self.state.get("tg_offset"):
-            params["offset"] = self.state["tg_offset"]
-        try:
-            data = self.http.get(f"https://api.telegram.org/bot{self.token}/getUpdates", params=params, timeout=15).json()
-        except Exception:
-            return []
-        out = []
-        for u in data.get("result", []):
-            self.state["tg_offset"] = u["update_id"] + 1
-            msg = u.get("message") or u.get("edited_message") or {}
-            cid = str((msg.get("chat") or {}).get("id") or "")
-            text = (msg.get("text") or "").strip()
-            if not cid or not text:
-                continue
-            cmd = text.split()[0].split("@")[0].lower()
-            if self.chat is None and cmd in ("/start", "/login"):
-                self.chat = cid
-                self.state["tg_chat"] = cid
-            if cid == self.chat:
-                out.append({"cmd": cmd, "text": text, "mid": msg.get("message_id")})
-        return out
-
-
-# ── MT5 login sent through Telegram (/login), stored encrypted ─────────────────
-
-def _fernet(token):
-    import base64
-    import hashlib
-    from cryptography.fernet import Fernet
-    return Fernet(base64.urlsafe_b64encode(hashlib.sha256(("fxalexg-mt5:" + token).encode()).digest()))
-
-
-def store_creds(state, token, login, password, server):
-    """Encrypted with a key derived from the Telegram bot token (a GitHub secret), so the Actions cache
-    never holds the password in readable form."""
-    blob = json.dumps({"login": login, "password": password, "server": server}).encode()
-    state["mt5_creds"] = _fernet(token).encrypt(blob).decode()
-
-
-def load_creds(state, token):
-    if not state.get("mt5_creds") or not token:
-        return None
-    try:
-        return json.loads(_fernet(token).decrypt(state["mt5_creds"].encode()))
-    except Exception:
-        return None
 
 
 # ── MetaTrader 5 ───────────────────────────────────────────────────────────────
@@ -265,159 +170,199 @@ def filter_text(btc_d, now):
     return txt
 
 
-def run(mt5, env, state, http=requests, now=None):
+def run(mt5, env, state, control=None, http=requests, now=None):
+    """state: this side's encrypted state (written back by main). control: the Telegram listener's state
+    (read-only here). Returns the process exit code."""
     now = pd.Timestamp(now) if now is not None else pd.Timestamp.now(tz="UTC")
-    mode = env.get("MODE", "live")
-    live = mode == "live"
-    tg = Telegram(env.get("MOMENTUM_TELEGRAM_TOKEN"), env.get("MOMENTUM_TELEGRAM_CHAT_ID"), state, http)
-    notify = tg.send if live else (lambda _t: False)
-    events = []
+    control = control or {}
+    live = env.get("MODE", "live") == "live"
     token = env.get("MOMENTUM_TELEGRAM_TOKEN") or ""
-    cmds = tg.commands() if live else []          # dry runs never consume your Telegram messages
+    chat = str(env.get("MOMENTUM_TELEGRAM_CHAT_ID") or control.get("tg_chat") or "") or None
+    notify = (lambda t: tg_send(http, token, chat, t)) if live else (lambda _t: False)
+    plog = []                                                   # private log -> /log in Telegram
+    def note(line):
+        plog.append(f"{now:%H:%M} {line}")
+    health = dict(state.get("health") or {})
+    events = []
+    done = list(state.get("done") or [])
+    requests_ = [r for r in control.get("requests", []) if r["id"] not in set(done)] if live else []
 
-    for c in cmds:
-        if c["cmd"] == "/login":
-            tg.delete(c["mid"])                    # don't leave the password in the chat
-            parts = c["text"].split()
-            if len(parts) >= 3 and parts[1].isdigit():
-                server = parts[3] if len(parts) > 3 else "Exness-MT5Trial9"
-                store_creds(state, token, parts[1], parts[2], server)
-                for k in ("login_alert", "asked_secrets"):
-                    state.pop(k, None)
-                notify(f"✅ MT5 login saved (encrypted) for account {parts[1]} on {server}. "
-                       f"Your message was deleted. Logging in now…")
-            else:
-                notify("Send it like this:\n<code>/login 12345678 YourPassword Exness-MT5Trial9</code>")
-        elif c["cmd"] == "/logout":
-            state.pop("mt5_creds", None)
-            notify("🗑️ Saved MT5 login deleted. Send /login to add one again.")
+    def finish(code, result):
+        state.update(last_run=now.timestamp(), result=result, log=plog[-60:], health=health, done=done[-200:])
+        return code
 
-    saved = load_creds(state, token)
-    login = env.get("MT5_LOGIN") or (saved or {}).get("login")
-    password = env.get("MT5_PASSWORD") or (saved or {}).get("password")
-    server = env.get("MT5_SERVER") if env.get("MT5_LOGIN") else (saved or {}).get("server")
+    creds = control.get("creds") or {}
+    login = env.get("MT5_LOGIN") or creds.get("login")
+    password = env.get("MT5_PASSWORD") or creds.get("password")
+    server = (env.get("MT5_SERVER") if env.get("MT5_LOGIN") else creds.get("server")) or DEFAULT_SERVER
     if not login or not password:
-        log("No MT5 login yet (send /login in Telegram, or add the MT5_LOGIN / MT5_PASSWORD secrets).")
-        if live and not state.get("asked_secrets"):
-            if notify("🛰️ I need your MT5 login to trade. Send:\n"
-                      "<code>/login 12345678 YourPassword Exness-MT5Trial9</code>\n"
-                      "I check messages once an hour and delete that message after reading it."):
-                state["asked_secrets"] = True
-        state["last_run"] = now.timestamp()
-        return 0
+        log("No MT5 login yet.")
+        note("No MT5 login yet — send /login ACCOUNT PASSWORD SERVER")
+        health.update(login="not set")
+        if live and not state.get("asked_login") and notify(
+                "🛰️ I need your MT5 login to trade. Send:\n<code>/login 12345678 YourPassword Exness-MT5Trial9</code>"):
+            state["asked_login"] = True
+        return finish(0, "waiting for /login")
 
     br = Broker(mt5)
-    ok, err = br.connect(env.get("MT5_PATH"), login, password, server or "Exness-MT5Trial9",
-                         portable=env.get("MT5_PORTABLE") == "1")
+    ok, err = br.connect(env.get("MT5_PATH"), login, password, server, portable=env.get("MT5_PORTABLE") == "1")
     if not ok:
         log("MT5 login failed.")
-        last = state.get("login_alert", 0)
-        if live and now.timestamp() - last > 6 * 3600:
-            notify(f"⚠️ <b>MT5 login failed</b> ({err}). Send /login again with the right account, "
-                   f"password and server.")
+        note(f"MT5 login failed for account {login} on {server}: {err}")
+        health.update(login=f"FAILED ({err})", error=f"login failed: {err}")
+        if live and (requests_ or now.timestamp() - state.get("login_alert", 0) > 6 * 3600):
+            notify(f"⚠️ <b>MT5 login failed</b> ({err}). Send /login again with the right account, password and server.")
             state["login_alert"] = now.timestamp()
-        state["last_run"] = now.timestamp()
-        return 1
+        done += [r["id"] for r in requests_]
+        return finish(1, "login failed")
     state.pop("login_alert", None)
+    state.pop("asked_login", None)
     log("MT5 connected.")
+    note(f"Logged in to {login} on {server}")
+    first_login = health.get("login") != "ok"
+    health.update(login="ok", error=None)
 
     term = mt5.terminal_info()
+    health["algo"] = "on" if (term is None or term.trade_allowed) else "OFF — orders may be rejected"
     if live and term is not None and not term.trade_allowed and not state.get("algo_alert"):
         notify("⚠️ MT5 reports Algo Trading is disabled; orders may be rejected.")
         state["algo_alert"] = True
 
     syms = {s: br.resolve(s) for s in getattr(config, "MOMENTUM_SYMBOLS", [])}
+    missing = [s for s, v in syms.items() if not v]
+    if missing:
+        note(f"Not on this account: {', '.join(missing)}")
     btc = br.resolve(getattr(config, "MOMENTUM_REGIME_SYMBOL", "BTCUSDm"))
     if not btc:
         log("BTC symbol not available — stopping.")
-        return 1
+        note("BTC symbol not available on this account — can't read the market filter")
+        health["error"] = "BTC symbol missing"
+        return finish(1, "BTC missing")
     br.calibrate(btc, now)
     btc_d = br.bars(btc, "mom_d1")
     on = M.regime_ok(btc_d, now)
+    closed_btc = M.closed_bars(btc_d, 24, now)
+    ema = float(closed_btc["close"].ewm(span=M.REGIME_EMA, adjust=False).mean().iloc[-1])
+    health["filter"] = {"on": bool(on), "btc": float(closed_btc["close"].iloc[-1]), "ema": ema}
     log(f"Market filter {'ON' if on else 'OFF'}.")
+    note(f"BTC filter {'ON' if on else 'OFF'}: BTC {health['filter']['btc']:,.0f} vs EMA{M.REGIME_EMA} {ema:,.0f}")
     if state.get("regime") is not None and state["regime"] != on:
         events.append(f"🛰️ <b>Market filter {'ON' if on else 'OFF'}</b> — BTC closed "
                       f"{'above' if on else 'below'} its {M.REGIME_EMA}-day EMA.")
-    state["regime"] = on
+    state["regime"] = bool(on)
 
     acct = mt5.account_info()
     balance = float(acct.balance) if acct else 0.0
+    health["balance"] = f"${balance:.2f}"
 
-    # 1. manage open trades
+    def close_pos(pos, why):
+        ok_, code, msg = br.close(pos) if live else (True, None, "")
+        note(f"Close {pos.symbol} ({why}): {'done' if ok_ else f'FAILED {code} {msg}'}")
+        return ok_, code, msg
+
+    # 1. queued Telegram requests that change positions
+    for r in requests_:
+        if r["cmd"] == "close":
+            want = r["arg"].upper().rstrip("M")
+            hits = [p for p in br.positions() if p.symbol.upper().rstrip("M") == want]
+            if not hits:
+                notify(f"🛰️ No open momentum trade on {r['arg']}.")
+            for p in hits:
+                ok_, code, msg = close_pos(p, "you asked")
+                notify(f"{'✅ Closed' if ok_ else '❌ Could not close'} {p.symbol}" + ("" if ok_ else f" ({code} {msg})"))
+        elif r["cmd"] == "closeall":
+            ps = br.positions()
+            res = [close_pos(p, "close all")[0] for p in ps]
+            notify(f"✅ Closed {sum(res)} of {len(ps)} momentum trades." if ps else "🛰️ No open momentum trades.")
+
+    # 2. manage open trades
     for pos in br.positions():
         eng = engine_of(pos)
         df = br.bars(pos.symbol, eng)
         action, new_sl = M.manage(df, eng, br.utc(pos.time), pos.sl, on, now)
         if action == "exit":
-            if live:
-                ok, code, why = br.close(pos)
-                events.append(f"🛰️ {'Closed' if ok else '⚠️ Could not close'} {pos.symbol} — market filter off"
-                              + ("" if ok else f" ({code} {why})"))
+            ok_, code, msg = close_pos(pos, "BTC filter off")
+            events.append(f"🛰️ {'Closed' if ok_ else '⚠️ Could not close'} {pos.symbol} — market filter off"
+                          + ("" if ok_ else f" ({code} {msg})"))
         elif action == "trail":
-            tick = mt5.symbol_info_tick(pos.symbol)
-            info = mt5.symbol_info(pos.symbol)
+            tick, info = mt5.symbol_info_tick(pos.symbol), mt5.symbol_info(pos.symbol)
             min_gap = (getattr(info, "trade_stops_level", 0) or 0) * info.point
-            if new_sl > (pos.sl or 0) + info.point and new_sl < tick.bid - min_gap and live:
-                ok, code, why = br.modify_sl(pos, new_sl)
-                if ok:
-                    events.append(f"🛰️ {pos.symbol}: stop raised to {new_sl:.6g}")
+            if new_sl > (pos.sl or 0) + info.point and new_sl < tick.bid - min_gap:
+                if live:
+                    ok_, code, msg = br.modify_sl(pos, new_sl)
+                    note(f"{pos.symbol}: stop {pos.sl:.6g} -> {new_sl:.6g} {'ok' if ok_ else f'FAILED {code} {msg}'}")
+                    if ok_:
+                        events.append(f"🛰️ {pos.symbol}: stop raised to {new_sl:.6g}")
+        else:
+            note(f"{pos.symbol}: holding, stop {pos.sl:.6g}, P&L ${pos.profit:+.2f}")
 
-    # 2. trades closed since the last run
+    # 3. trades closed since the last run
     since = pd.Timestamp(state["last_run"], unit="s", tz="UTC") if state.get("last_run") else now - pd.Timedelta(hours=2)
     for d in br.deals(since):
         if d.entry == mt5.DEAL_ENTRY_OUT:
             res = d.profit + getattr(d, "swap", 0.0) + getattr(d, "commission", 0.0)
             events.append(f"🏁 <b>Closed {d.symbol}</b> {'✅' if res > 0 else '❌'} <b>${res:+.2f}</b>")
+            note(f"Closed {d.symbol}: ${res:+.2f}")
 
-    # 3. new entries
+    # 4. new entries
     entries = 0
-    if on:
+    risk = float(control.get("risk_pct") or env.get("MOMENTUM_RISK_PCT") or getattr(config, "MOMENTUM_RISK_PCT", 5.0))
+    if control.get("paused"):
+        note("Paused by you (/resume to allow new trades)")
+    elif not on:
+        note("No new buys: BTC filter is off")
+    else:
         cap = getattr(config, "MOMENTUM_MAX_RISK_PCT", 8.0)
-        risk = float(env.get("MOMENTUM_RISK_PCT") or getattr(config, "MOMENTUM_RISK_PCT", 5.0))
         max_open = getattr(config, "MOMENTUM_MAX_OPEN", 4)
         for eng in getattr(config, "MOMENTUM_ENGINES", ["mom_4h", "mom_d1"]):
+            label = M.ENGINES[eng]["label"]
             for name, sym in syms.items():
                 open_pos = br.positions()
                 if not sym or any(p.symbol == sym for p in open_pos):
                     continue
                 if len(open_pos) >= max_open:
+                    note(f"Max {max_open} open trades reached")
                     break
-                df = br.bars(sym, eng)
-                setup = M.entry_signal(sym, df, eng, on, now)
+                setup = M.entry_signal(sym, br.bars(sym, eng), eng, on, now)
                 if not setup:
+                    note(f"{sym} {label}: no breakout")
                     continue
-                hrs = M.ENGINES[eng]["tf_hours"]
-                candle_close = pd.Timestamp(setup["signal_time"]) + pd.Timedelta(hours=hrs)
+                candle_close = pd.Timestamp(setup["signal_time"]) + pd.Timedelta(hours=M.ENGINES[eng]["tf_hours"])
                 if any(d.symbol == sym and d.entry == mt5.DEAL_ENTRY_IN for d in br.deals(candle_close)):
-                    continue      # already bought this breakout in an earlier run
+                    note(f"{sym} {label}: breakout already traded")
+                    continue
                 info, tick = mt5.symbol_info(sym), mt5.symbol_info_tick(sym)
                 if info.spread * info.point > getattr(config, "MOMENTUM_MAX_SPREAD_FRAC", 0.15) * setup["sl_dist"]:
+                    note(f"{sym} {label}: breakout skipped, spread too wide")
                     events.append(f"🛰️ {sym} breakout skipped: spread too wide for the stop")
                     continue
                 lot, risk_usd, why = size_trade(info, setup["sl_dist"], balance, risk, cap)
                 if lot is None:
+                    note(f"{sym} {label}: breakout skipped, {why}")
                     events.append(f"🛰️ {sym} breakout skipped: {why}")
                     continue
                 sl = tick.ask - setup["sl_dist"]
                 if not live:
                     entries += 1
                     continue
-                ok, code, why = br.buy(sym, lot, sl, COMMENT[eng])
-                if ok:
+                ok_, code, msg = br.buy(sym, lot, sl, COMMENT[eng])
+                note(f"BUY {sym} {lot} lot, stop {sl:.6g}, risk ${risk_usd:.2f}: {'ok' if ok_ else f'REJECTED {code} {msg}'}")
+                if ok_:
                     entries += 1
-                    events.append(f"🟢 <b>BUY {sym}</b> ({M.ENGINES[eng]['label']} breakout)\n"
-                                  f"Entry ~{tick.ask:.6g} · Stop {sl:.6g} · Lots {lot}\n"
-                                  f"Risk ${risk_usd:.2f} ({risk_usd / balance * 100:.1f}%)")
+                    events.append(f"🟢 <b>BUY {sym}</b> ({label} breakout)\nEntry ~{tick.ask:.6g} · Stop {sl:.6g} · "
+                                  f"Lots {lot}\nRisk ${risk_usd:.2f} ({risk_usd / balance * 100:.1f}%)")
                 else:
-                    events.append(f"❌ {sym} order rejected ({code} {why})")
+                    events.append(f"❌ {sym} order rejected ({code} {msg})")
     log(f"Checked {sum(1 for s in syms.values() if s)} symbols; {entries} new entr{'y' if entries == 1 else 'ies'}.")
+    health["open"] = len(br.positions())
 
-    # 4. Telegram: commands, events, daily summary
+    # 5. Telegram replies, events, daily summary
     def status():
-        lines = ["🛰️ <b>Momentum Breakout — status</b>"]
+        lines = ["🛰️ <b>Momentum bot — status</b>"]
         a = mt5.account_info()
         if a:
             lines.append(f"Balance <b>${a.balance:.2f}</b> · Equity <b>${a.equity:.2f}</b>")
+        lines.append(f"New trades: {'PAUSED ⏸️' if control.get('paused') else 'on'} · Risk {risk:g}%/trade")
         ps = br.positions()
         lines.append(f"\n<b>Open trades: {len(ps)}</b>")
         for p in ps:
@@ -435,25 +380,26 @@ def run(mt5, env, state, http=requests, now=None):
         return "🛰️ <b>Last momentum trades</b>\n" + "\n".join(
             f"• {br.utc(d.time):%d %b} {d.symbol}: <b>${d.profit:+.2f}</b>" for d in ds)
 
-    handlers = {"/status": status, "/trades": trades, "/filter": lambda: filter_text(btc_d, now)}
-    help_txt = ("🛰️ <b>Momentum Breakout (GitHub cloud)</b>\nI run once an hour, so replies can take up to an hour.\n"
-                "/status · /trades · /filter · /login · /logout · /help")
     if live:
-        for c in cmds:
-            if c["cmd"] in handlers:
-                notify(handlers[c["cmd"]]())
-            elif c["cmd"] in ("/start", "/help"):
-                notify(help_txt)
+        for r in requests_:
+            if r["cmd"] == "status":
+                notify(status())
+            elif r["cmd"] == "trades":
+                notify(trades())
+            elif r["cmd"] == "run":
+                notify("✅ Check done. " + (f"{len(events)} update(s) below." if events else
+                                           f"Nothing new. {'BTC filter on' if on else 'BTC filter off'}, "
+                                           f"{health['open']} open trade(s). /log for details."))
+            done.append(r["id"])
+        if first_login and creds:
+            notify(f"✅ <b>Logged in to MT5</b> ({login} on {server}).\n\n" + status())
         if events:
             notify("\n\n".join(events))
         today = now.strftime("%Y-%m-%d")
         if now.hour >= getattr(config, "MONITOR_DAILY_HOUR", 7) and state.get("summary_day") != today:
             if notify("☀️ <b>Daily summary</b>\n\n" + status()):
                 state["summary_day"] = today
-        if not state.get("hello") and notify(f"🛰️ <b>Momentum bot is live on GitHub</b> (checks hourly).\n\n{filter_text(btc_d, now)}"):
-            state["hello"] = True
-    state["last_run"] = now.timestamp()
-    return 0
+    return finish(0, f"ok, {entries} new trade(s)")
 
 
 def main():
@@ -462,18 +408,23 @@ def main():
     except ImportError:
         log("MetaTrader5 package not installed (this runs on the Windows runner).")
         return 1
-    state = load_state()
+    token = os.environ.get("MOMENTUM_TELEGRAM_TOKEN") or ""
+    state = load_json(RUNNER_STATE, token)
+    control = load_json(CONTROL_STATE, token)
     code = 1
     try:
-        code = run(mt5, dict(os.environ), state)
+        code = run(mt5, dict(os.environ), state, control)
     except Exception as e:
         log(f"Run failed: {type(e).__name__}")
-        traceback.print_exc(limit=3)
+        traceback.print_exc(limit=2)
+        state.setdefault("health", {})["error"] = f"{type(e).__name__}: {str(e)[:200]}"
+        state["result"] = "crashed"
+        state["last_run"] = datetime.now(timezone.utc).timestamp()
         if os.environ.get("MODE", "live") == "live":
-            Telegram(os.environ.get("MOMENTUM_TELEGRAM_TOKEN"), os.environ.get("MOMENTUM_TELEGRAM_CHAT_ID"),
-                     state).send(f"⚠️ Momentum bot run failed: {type(e).__name__}: {str(e)[:200]}")
+            chat = os.environ.get("MOMENTUM_TELEGRAM_CHAT_ID") or control.get("tg_chat")
+            tg_send(requests, token, chat, f"⚠️ Momentum bot run failed: {type(e).__name__}: {str(e)[:200]}")
     finally:
-        save_state(state)
+        save_json(RUNNER_STATE, state, token)
         try:
             mt5.shutdown()
         except Exception:

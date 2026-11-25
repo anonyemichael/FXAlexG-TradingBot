@@ -121,20 +121,21 @@ class FakeHTTP:
 
 ENV = {"MT5_LOGIN": "123", "MT5_PASSWORD": "right", "MT5_SERVER": "Exness-MT5Trial9",
        "MOMENTUM_TELEGRAM_TOKEN": "tok", "MOMENTUM_TELEGRAM_CHAT_ID": "999", "MODE": "live", "MOMENTUM_RISK_PCT": "5"}
+NO_SECRETS = {"MOMENTUM_TELEGRAM_TOKEN": "tok", "MOMENTUM_TELEGRAM_CHAT_ID": "999", "MODE": "live"}
 
 
-def _run(mt5, env=ENV, state=None, http=None):
+def _run(mt5, env=ENV, state=None, control=None, http=None):
     C.config.MOMENTUM_SYMBOLS = ["SOLUSDm", "ADAUSDm"]          # ADA doesn't exist on the fake broker
     C.config.MOMENTUM_ENGINES = ["mom_4h"]
     state = {} if state is None else state
     http = http or FakeHTTP()
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        code = C.run(mt5, env, state, http=http, now=NOW)
+        code = C.run(mt5, env, state, control or {}, http=http, now=NOW)
     return code, state, http, buf.getvalue()
 
 
-def test_buys_breakout_with_capped_risk_and_quiet_logs():
+def test_buys_breakout_with_capped_risk_and_quiet_public_log():
     mt5 = FakeMT5()
     code, state, http, out = _run(mt5)
     assert code == 0 and len(mt5.orders) == 1, (code, mt5.orders, http.sent)
@@ -145,13 +146,15 @@ def test_buys_breakout_with_capped_risk_and_quiet_logs():
     assert any("BUY SOLUSDm" in t for t in http.sent)
     for secret in ("123", "10.0", "SOLUSDm", str(round(o["price"], 2))):   # public log stays clean
         assert secret not in out, (secret, out)
+    assert any("BUY SOLUSDm" in line for line in state["log"])            # private log (/log) has details
+    assert state["health"]["login"] == "ok" and state["health"]["filter"]["on"] is True
 
 
 def test_same_breakout_not_bought_twice():
     mt5 = FakeMT5()
-    _run(mt5)
+    _, state, _, _ = _run(mt5)
     mt5.positions.clear()                                    # stopped out within the same 4H candle
-    _run(mt5)
+    _run(mt5, state=state)
     assert len(mt5.orders) == 1
 
 
@@ -176,68 +179,67 @@ def test_bad_login_alerts_once_per_6h():
     mt5 = FakeMT5()
     env = {**ENV, "MT5_PASSWORD": "wrong"}
     code, state, http, out = _run(mt5, env)
-    assert code == 1 and any("login failed" in t for t in http.sent)
+    assert code == 1 and any("login failed" in t for t in http.sent) and "wrong" not in out
     n = len(http.sent)
-    _run(mt5, env, state, http)
+    _run(mt5, env, state, http=http)
     assert len(http.sent) == n                               # no repeat within 6 hours
-    assert "wrong" not in out
+    assert "FAILED" in state["health"]["login"]
 
 
 def test_dry_mode_never_trades_or_messages():
     mt5 = FakeMT5()
-    code, state, http, out = _run(mt5, {**ENV, "MODE": "dry"})
-    assert code == 0 and not mt5.orders and not http.sent and "1 new entry" in out
+    code, state, http, out = _run(mt5, {**ENV, "MODE": "dry"}, control={"requests": [{"id": 1, "cmd": "status", "arg": "", "ts": 0}]})
+    assert code == 0 and not mt5.orders and not http.sent and "1 new entry" in out and not state["done"]
 
 
-def test_missing_secrets_and_commands():
-    code, state, http, _ = _run(FakeMT5(), {"MOMENTUM_TELEGRAM_TOKEN": "tok", "MOMENTUM_TELEGRAM_CHAT_ID": "999", "MODE": "live"})
-    assert code == 0 and any("/login" in t for t in http.sent)
-    mt5 = FakeMT5(breakout=False)
-    http = FakeHTTP()
-    http.updates = [{"update_id": 5, "message": {"chat": {"id": 999}, "text": "/status"}},
-                    {"update_id": 6, "message": {"chat": {"id": 555}, "text": "/status"}}]   # stranger ignored
-    _, state, http, _ = _run(mt5, http=http)
-    assert sum("status" in t.lower() for t in http.sent) == 2      # /status reply + first-run daily summary
-    assert state["tg_offset"] == 7
-
-
-def test_login_via_telegram():
+def test_login_from_telegram_control_and_ask_once():
     mt5 = FakeMT5()
-    env = {"MOMENTUM_TELEGRAM_TOKEN": "tok", "MODE": "live", "MOMENTUM_RISK_PCT": "5"}     # no MT5 secrets
-    http = FakeHTTP()
-    http.updates = [{"update_id": 1, "message": {"message_id": 11, "chat": {"id": 777}, "text": "/start"}},
-                    {"update_id": 2, "message": {"message_id": 12, "chat": {"id": 777},
-                                                 "text": "/login 123 right Exness-MT5Trial9"}},
-                    {"update_id": 3, "message": {"message_id": 13, "chat": {"id": 555},     # stranger
-                                                 "text": "/login 999 hacker Evil-Server"}}]
-    code, state, http, out = _run(mt5, env, http=http)
-    assert code == 0 and mt5.logged_in and len(mt5.orders) == 1          # logged in and traded in the same run
-    assert http.deleted == [12]                                          # password message removed
-    assert "right" not in json_dump(state) and "right" not in out        # never stored or logged readable
-    assert any("login saved" in t for t in http.sent)
-    mt5.positions.clear(); mt5.logged_in = False
-    code, state, http, _ = _run(mt5, env, state, http)                  # next hour: uses the saved login
-    assert code == 0 and mt5.logged_in
-    assert C.load_creds(state, "other-token") is None                    # useless without the bot token
-    http.updates = [{"update_id": 4, "message": {"message_id": 14, "chat": {"id": 777}, "text": "/logout"}}]
-    _run(mt5, env, state, http)
-    assert "mt5_creds" not in state
+    code, state, http, _ = _run(mt5, NO_SECRETS)
+    assert code == 0 and not mt5.logged_in and any("/login" in t for t in http.sent)
+    n = len(http.sent)
+    _run(mt5, NO_SECRETS, state, http=http)
+    assert len(http.sent) == n                               # asked only once
+    control = {"creds": {"login": "123", "password": "right", "server": "Exness-MT5Trial9"}}
+    code, state, http, out = _run(mt5, NO_SECRETS, state, control, http)
+    assert code == 0 and mt5.logged_in and len(mt5.orders) == 1
+    assert any("Logged in to MT5" in t for t in http.sent) and "right" not in out
 
 
-def test_login_bad_format_and_wrong_password():
-    env = {"MOMENTUM_TELEGRAM_TOKEN": "tok", "MOMENTUM_TELEGRAM_CHAT_ID": "999", "MODE": "live"}
-    http = FakeHTTP()
-    http.updates = [{"update_id": 1, "message": {"message_id": 5, "chat": {"id": 999}, "text": "/login oops"}}]
-    _, state, http, _ = _run(FakeMT5(), env, http=http)
-    assert any("Send it like this" in t for t in http.sent) and "mt5_creds" not in state
-    http.updates = [{"update_id": 2, "message": {"message_id": 6, "chat": {"id": 999}, "text": "/login 123 wrong"}}]
-    code, state, http, _ = _run(FakeMT5(), env, state, http)
-    assert code == 1 and any("login failed" in t and "/login again" in t for t in http.sent)
+def test_pause_and_risk_from_telegram():
+    mt5 = FakeMT5()
+    _run(mt5, control={"paused": True})
+    assert not mt5.orders
+    _run(mt5, control={"risk_pct": 1.0})
+    o = mt5.orders[0]
+    loss = (o["price"] - o["sl"]) * o["volume"]
+    assert loss <= 10.0 * 0.01 + 0.01 or o["volume"] == 0.01   # 1% (or the broker minimum within the cap)
 
 
-def json_dump(d):
-    import json
-    return json.dumps(d)
+def test_telegram_requests_answered_once():
+    mt5 = FakeMT5(breakout=False)
+    mt5.positions.append(NS(ticket=9, symbol="SOLUSDm", volume=0.05, sl=1.0, tp=0.0, magic=C.MAGIC,
+                            comment="MOM 4H", time=int((NOW - pd.Timedelta(days=1)).timestamp()), profit=0.5))
+    control = {"requests": [{"id": 1, "cmd": "status", "arg": "", "ts": 0},
+                            {"id": 2, "cmd": "close", "arg": "SOLUSD", "ts": 0},
+                            {"id": 3, "cmd": "run", "arg": "", "ts": 0}]}
+    code, state, http, _ = _run(mt5, control=control)
+    assert len(mt5.closes) == 1 and mt5.closes[0]["position"] == 9
+    assert any("Momentum bot — status" in t for t in http.sent) and any("Closed SOLUSDm" in t for t in http.sent)
+    assert any("Check done" in t for t in http.sent) and state["done"] == [1, 2, 3]
+    n = len(http.sent)
+    _run(mt5, state=state, control=control, http=http)      # same requests again -> ignored
+    assert not any("status" in t.lower() and "Daily" not in t for t in http.sent[n:])
+
+
+def test_state_is_encrypted_at_rest():
+    import tempfile
+    from cloud_common import load_json, save_json
+    path = os.path.join(tempfile.mkdtemp(), "s.json")
+    save_json(path, {"creds": {"password": "Secret@1"}, "log": ["BUY SOLUSDm"]}, "tok")
+    raw = open(path, "rb").read()
+    assert b"Secret" not in raw and b"SOLUSD" not in raw and raw.startswith(b"enc:")
+    assert load_json(path, "tok")["creds"]["password"] == "Secret@1"
+    assert load_json(path, "other-token") == {}
 
 
 def test_size_trade_rules():
