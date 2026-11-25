@@ -1,0 +1,58 @@
+# Temporary feasibility check: can MetaTrader 5 be installed and started on a GitHub Windows runner?
+name: MT5 runner smoke test
+
+on:
+  push:
+    branches: [ccr-40ef48ac-4webyc]
+    paths: [".github/workflows/mt5-smoke.yml", "cloud/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install MetaTrader 5 (Exness build, fallback MetaQuotes)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $urls = @(
+            "https://download.mql5.com/cdn/web/exness.technologies.ltd/mt5/exness5setup.exe",
+            "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe"
+          )
+          foreach ($u in $urls) {
+            try { Invoke-WebRequest -Uri $u -OutFile "$env:RUNNER_TEMP\mt5setup.exe" -UseBasicParsing; Write-Host "Downloaded $u"; break }
+            catch { Write-Host "Failed $u : $($_.Exception.Message)" }
+          }
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          Start-Process "$env:RUNNER_TEMP\mt5setup.exe" -ArgumentList "/auto" -Wait
+          Write-Host "Installer exited after $($sw.Elapsed.TotalSeconds) s"
+          $deadline = (Get-Date).AddMinutes(8)
+          do {
+            $t = Get-ChildItem "C:\Program Files", "C:\Program Files (x86)" -Recurse -Filter terminal64.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($t) { break }; Start-Sleep 10
+          } while ((Get-Date) -lt $deadline)
+          if (-not $t) { throw "terminal64.exe not found" }
+          Write-Host "Terminal: $($t.FullName)"
+          Get-Process | Where-Object { $_.Name -like "terminal*" -or $_.Name -like "*setup*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+          "MT5_PATH=$($t.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Start the terminal from Python
+        shell: pwsh
+        run: |
+          pip install MetaTrader5 pandas
+          @'
+          import os, time, MetaTrader5 as mt5
+          t0 = time.time()
+          ok = mt5.initialize(path=os.environ["MT5_PATH"], timeout=180000)
+          print("initialize:", ok, "after", round(time.time() - t0), "s; last_error:", mt5.last_error())
+          if ok:
+              ti = mt5.terminal_info()
+              print("terminal:", ti.name, "| build", mt5.version(), "| connected:", ti.connected)
+              mt5.shutdown()
+          '@ | Out-File -Encoding utf8 smoke.py
+          python smoke.py
