@@ -1,8 +1,9 @@
 # Momentum Breakout bot running on GitHub itself (no VPS): once an hour a Windows machine installs MT5,
 # logs in, runs cloud_runner.py (manage trades, new breakouts, Telegram) and shuts down.
 #
-# Secrets (Settings -> Secrets and variables -> Actions):
-#   MT5_LOGIN, MT5_PASSWORD             required
+# MT5 login: send it to the Telegram bot as  /login <account> <password> [server]  (stored encrypted),
+# or set secrets (Settings -> Secrets and variables -> Actions):
+#   MT5_LOGIN, MT5_PASSWORD             optional when /login is used
 #   MT5_SERVER                          optional, default Exness-MT5Trial9
 #   MOMENTUM_TELEGRAM_TOKEN             Telegram bot that reports and answers /status /trades /filter
 #   MOMENTUM_TELEGRAM_CHAT_ID           optional (otherwise the first /start claims the bot)
@@ -48,7 +49,7 @@ jobs:
           python-version: "3.11"
 
       - name: Python packages
-        run: pip install --quiet --disable-pip-version-check MetaTrader5 pandas numpy requests
+        run: pip install --quiet --disable-pip-version-check MetaTrader5 pandas numpy requests cryptography
 
       - name: Restore bot state
         uses: actions/cache/restore@v4

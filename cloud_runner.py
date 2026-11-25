@@ -11,6 +11,8 @@ then exits. State (Telegram chat/offset, last run, filter status) is kept in the
 The repository is public, so Actions logs are public: this script never prints the account number,
 balance, prices or trades. Those go to Telegram only.
 
+MT5 login: GitHub secrets MT5_LOGIN / MT5_PASSWORD / MT5_SERVER, or sent in Telegram as
+  /login <account> <password> [server]  (stored encrypted in the Actions cache; the message is deleted).
 Env: MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, MT5_PATH (terminal64.exe), MOMENTUM_TELEGRAM_TOKEN,
      MOMENTUM_TELEGRAM_CHAT_ID (optional), MOMENTUM_RISK_PCT (default 5), MODE=live|dry, CLOUD_STATE (state file)
 """
@@ -70,8 +72,16 @@ class Telegram:
         except Exception:
             return False
 
+    def delete(self, message_id):
+        try:
+            self.http.post(f"https://api.telegram.org/bot{self.token}/deleteMessage",
+                           json={"chat_id": self.chat, "message_id": message_id}, timeout=15)
+        except Exception:
+            pass
+
     def commands(self):
-        """New commands from the owner chat. The first /start claims the bot if no chat id is configured."""
+        """New commands from the owner chat: [{"cmd", "text", "mid"}]. The first /start (or /login) claims the
+        bot when no chat id is configured; anyone else is ignored."""
         if not self.token:
             return []
         params = {"timeout": 0}
@@ -89,12 +99,38 @@ class Telegram:
             text = (msg.get("text") or "").strip()
             if not cid or not text:
                 continue
-            if self.chat is None and text.lower().startswith("/start"):
+            cmd = text.split()[0].split("@")[0].lower()
+            if self.chat is None and cmd in ("/start", "/login"):
                 self.chat = cid
                 self.state["tg_chat"] = cid
             if cid == self.chat:
-                out.append(text.split()[0].split("@")[0].lower())
+                out.append({"cmd": cmd, "text": text, "mid": msg.get("message_id")})
         return out
+
+
+# ── MT5 login sent through Telegram (/login), stored encrypted ─────────────────
+
+def _fernet(token):
+    import base64
+    import hashlib
+    from cryptography.fernet import Fernet
+    return Fernet(base64.urlsafe_b64encode(hashlib.sha256(("fxalexg-mt5:" + token).encode()).digest()))
+
+
+def store_creds(state, token, login, password, server):
+    """Encrypted with a key derived from the Telegram bot token (a GitHub secret), so the Actions cache
+    never holds the password in readable form."""
+    blob = json.dumps({"login": login, "password": password, "server": server}).encode()
+    state["mt5_creds"] = _fernet(token).encrypt(blob).decode()
+
+
+def load_creds(state, token):
+    if not state.get("mt5_creds") or not token:
+        return None
+    try:
+        return json.loads(_fernet(token).decrypt(state["mt5_creds"].encode()))
+    except Exception:
+        return None
 
 
 # ── MetaTrader 5 ───────────────────────────────────────────────────────────────
@@ -236,25 +272,51 @@ def run(mt5, env, state, http=requests, now=None):
     tg = Telegram(env.get("MOMENTUM_TELEGRAM_TOKEN"), env.get("MOMENTUM_TELEGRAM_CHAT_ID"), state, http)
     notify = tg.send if live else (lambda _t: False)
     events = []
+    token = env.get("MOMENTUM_TELEGRAM_TOKEN") or ""
+    cmds = tg.commands() if live else []          # dry runs never consume your Telegram messages
 
-    if not env.get("MT5_LOGIN") or not env.get("MT5_PASSWORD"):
-        log("MT5_LOGIN / MT5_PASSWORD secrets are not set — nothing to do.")
+    for c in cmds:
+        if c["cmd"] == "/login":
+            tg.delete(c["mid"])                    # don't leave the password in the chat
+            parts = c["text"].split()
+            if len(parts) >= 3 and parts[1].isdigit():
+                server = parts[3] if len(parts) > 3 else "Exness-MT5Trial9"
+                store_creds(state, token, parts[1], parts[2], server)
+                for k in ("login_alert", "asked_secrets"):
+                    state.pop(k, None)
+                notify(f"✅ MT5 login saved (encrypted) for account {parts[1]} on {server}. "
+                       f"Your message was deleted. Logging in now…")
+            else:
+                notify("Send it like this:\n<code>/login 12345678 YourPassword Exness-MT5Trial9</code>")
+        elif c["cmd"] == "/logout":
+            state.pop("mt5_creds", None)
+            notify("🗑️ Saved MT5 login deleted. Send /login to add one again.")
+
+    saved = load_creds(state, token)
+    login = env.get("MT5_LOGIN") or (saved or {}).get("login")
+    password = env.get("MT5_PASSWORD") or (saved or {}).get("password")
+    server = env.get("MT5_SERVER") if env.get("MT5_LOGIN") else (saved or {}).get("server")
+    if not login or not password:
+        log("No MT5 login yet (send /login in Telegram, or add the MT5_LOGIN / MT5_PASSWORD secrets).")
         if live and not state.get("asked_secrets"):
-            tg.commands()
-            if notify("🛰️ Add GitHub secrets <b>MT5_LOGIN</b> and <b>MT5_PASSWORD</b> so I can trade."):
+            if notify("🛰️ I need your MT5 login to trade. Send:\n"
+                      "<code>/login 12345678 YourPassword Exness-MT5Trial9</code>\n"
+                      "I check messages once an hour and delete that message after reading it."):
                 state["asked_secrets"] = True
+        state["last_run"] = now.timestamp()
         return 0
 
     br = Broker(mt5)
-    ok, err = br.connect(env.get("MT5_PATH"), env["MT5_LOGIN"], env["MT5_PASSWORD"],
-                         env.get("MT5_SERVER") or "Exness-MT5Trial9", portable=env.get("MT5_PORTABLE") == "1")
+    ok, err = br.connect(env.get("MT5_PATH"), login, password, server or "Exness-MT5Trial9",
+                         portable=env.get("MT5_PORTABLE") == "1")
     if not ok:
         log("MT5 login failed.")
         last = state.get("login_alert", 0)
         if live and now.timestamp() - last > 6 * 3600:
-            tg.commands()
-            notify(f"⚠️ <b>MT5 login failed</b> ({err}). Check the MT5_LOGIN / MT5_PASSWORD / MT5_SERVER secrets.")
+            notify(f"⚠️ <b>MT5 login failed</b> ({err}). Send /login again with the right account, "
+                   f"password and server.")
             state["login_alert"] = now.timestamp()
+        state["last_run"] = now.timestamp()
         return 1
     state.pop("login_alert", None)
     log("MT5 connected.")
@@ -375,14 +437,13 @@ def run(mt5, env, state, http=requests, now=None):
 
     handlers = {"/status": status, "/trades": trades, "/filter": lambda: filter_text(btc_d, now)}
     help_txt = ("🛰️ <b>Momentum Breakout (GitHub cloud)</b>\nI run once an hour, so replies can take up to an hour.\n"
-                "/status · /trades · /filter · /help")
+                "/status · /trades · /filter · /login · /logout · /help")
     if live:
-        first = tg.chat is None
-        for cmd in tg.commands():
-            if cmd in handlers:
-                notify(handlers[cmd]())
-            elif cmd in ("/start", "/help"):
-                notify(help_txt if not (first and cmd == "/start") else "✅ This chat now receives the momentum bot.\n\n" + help_txt)
+        for c in cmds:
+            if c["cmd"] in handlers:
+                notify(handlers[c["cmd"]]())
+            elif c["cmd"] in ("/start", "/help"):
+                notify(help_txt)
         if events:
             notify("\n\n".join(events))
         today = now.strftime("%Y-%m-%d")

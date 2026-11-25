@@ -44,7 +44,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Install dependencies
-        run: pip install pandas numpy requests
+        run: pip install pandas numpy requests cryptography
       - name: Byte-compile everything
         run: python -m py_compile *.py
       - name: Momentum strategy tests

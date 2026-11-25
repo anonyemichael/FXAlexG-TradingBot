@@ -105,10 +105,14 @@ class FakeMT5:
 
 
 class FakeHTTP:
-    def __init__(self): self.sent, self.updates = [], []
+    def __init__(self): self.sent, self.updates, self.deleted = [], [], []
 
     def post(self, url, json=None, timeout=None):
-        self.sent.append(json["text"]); return NS(status_code=200)
+        if url.endswith("/deleteMessage"):
+            self.deleted.append(json["message_id"])
+        else:
+            self.sent.append(json["text"])
+        return NS(status_code=200)
 
     def get(self, url, params=None, timeout=None):
         ups, self.updates = self.updates, []
@@ -187,7 +191,7 @@ def test_dry_mode_never_trades_or_messages():
 
 def test_missing_secrets_and_commands():
     code, state, http, _ = _run(FakeMT5(), {"MOMENTUM_TELEGRAM_TOKEN": "tok", "MOMENTUM_TELEGRAM_CHAT_ID": "999", "MODE": "live"})
-    assert code == 0 and any("MT5_LOGIN" in t for t in http.sent)
+    assert code == 0 and any("/login" in t for t in http.sent)
     mt5 = FakeMT5(breakout=False)
     http = FakeHTTP()
     http.updates = [{"update_id": 5, "message": {"chat": {"id": 999}, "text": "/status"}},
@@ -195,6 +199,45 @@ def test_missing_secrets_and_commands():
     _, state, http, _ = _run(mt5, http=http)
     assert sum("status" in t.lower() for t in http.sent) == 2      # /status reply + first-run daily summary
     assert state["tg_offset"] == 7
+
+
+def test_login_via_telegram():
+    mt5 = FakeMT5()
+    env = {"MOMENTUM_TELEGRAM_TOKEN": "tok", "MODE": "live", "MOMENTUM_RISK_PCT": "5"}     # no MT5 secrets
+    http = FakeHTTP()
+    http.updates = [{"update_id": 1, "message": {"message_id": 11, "chat": {"id": 777}, "text": "/start"}},
+                    {"update_id": 2, "message": {"message_id": 12, "chat": {"id": 777},
+                                                 "text": "/login 123 right Exness-MT5Trial9"}},
+                    {"update_id": 3, "message": {"message_id": 13, "chat": {"id": 555},     # stranger
+                                                 "text": "/login 999 hacker Evil-Server"}}]
+    code, state, http, out = _run(mt5, env, http=http)
+    assert code == 0 and mt5.logged_in and len(mt5.orders) == 1          # logged in and traded in the same run
+    assert http.deleted == [12]                                          # password message removed
+    assert "right" not in json_dump(state) and "right" not in out        # never stored or logged readable
+    assert any("login saved" in t for t in http.sent)
+    mt5.positions.clear(); mt5.logged_in = False
+    code, state, http, _ = _run(mt5, env, state, http)                  # next hour: uses the saved login
+    assert code == 0 and mt5.logged_in
+    assert C.load_creds(state, "other-token") is None                    # useless without the bot token
+    http.updates = [{"update_id": 4, "message": {"message_id": 14, "chat": {"id": 777}, "text": "/logout"}}]
+    _run(mt5, env, state, http)
+    assert "mt5_creds" not in state
+
+
+def test_login_bad_format_and_wrong_password():
+    env = {"MOMENTUM_TELEGRAM_TOKEN": "tok", "MOMENTUM_TELEGRAM_CHAT_ID": "999", "MODE": "live"}
+    http = FakeHTTP()
+    http.updates = [{"update_id": 1, "message": {"message_id": 5, "chat": {"id": 999}, "text": "/login oops"}}]
+    _, state, http, _ = _run(FakeMT5(), env, http=http)
+    assert any("Send it like this" in t for t in http.sent) and "mt5_creds" not in state
+    http.updates = [{"update_id": 2, "message": {"message_id": 6, "chat": {"id": 999}, "text": "/login 123 wrong"}}]
+    code, state, http, _ = _run(FakeMT5(), env, state, http)
+    assert code == 1 and any("login failed" in t and "/login again" in t for t in http.sent)
+
+
+def json_dump(d):
+    import json
+    return json.dumps(d)
 
 
 def test_size_trade_rules():
