@@ -193,6 +193,7 @@ wine "$WINPY" -c "import MetaTrader5 as m; print('MetaTrader5 package', m.__vers
   || die "MetaTrader5 package not importable in Wine Python"
 
 # ── 9. Switch on Algo Trading (the bridge refuses to trade without it) ──────
+if [ ! -f "$PREFIX/.fxalexg_algo_enabled" ]; then
 log "Starting MT5 once to create its settings, then enabling Algo Trading"
 timeout 120 wine "$TERM_EXE" >/dev/null 2>&1 &   # same (non-portable) data folder the bridge will use
 sleep 60
@@ -230,6 +231,8 @@ for p in paths:
     open(p, "wb").write(b"\xff\xfe" + body.encode("utf-16-le"))
     print("Algo Trading enabled in", p)
 PY
+touch "$PREFIX/.fxalexg_algo_enabled"
+fi
 
 # ── 10. Services ─────────────────────────────────────────────────────────────
 log "Installing services mt5-bridge and fxalexg-bot"
@@ -273,11 +276,13 @@ EOF
 sudo systemctl daemon-reload
 sudo systemctl enable mt5-bridge.service fxalexg-bot.service >/dev/null 2>&1
 
-# ── 11. SSH key for GitHub Actions deploys ───────────────────────────────────
+# ── 11. SSH key for GitHub Actions deploys (not needed when the server updates itself) ──
+if [ "${SKIP_DEPLOY_KEY:-0}" != 1 ]; then
 mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
 [ -f "$HOME/.ssh/github_deploy" ] || ssh-keygen -q -t ed25519 -N "" -f "$HOME/.ssh/github_deploy" -C github-actions-deploy
 touch "$HOME/.ssh/authorized_keys" && chmod 600 "$HOME/.ssh/authorized_keys"
 grep -qF "$(cat "$HOME/.ssh/github_deploy.pub")" "$HOME/.ssh/authorized_keys" || cat "$HOME/.ssh/github_deploy.pub" >> "$HOME/.ssh/authorized_keys"
+fi
 
 # ── 12. Start and check ──────────────────────────────────────────────────────
 if [ "$START_SERVICES" = 1 ]; then
@@ -299,6 +304,7 @@ if [ "$START_SERVICES" = 1 ]; then
   systemctl is-active --quiet fxalexg-bot && echo "✅ Bot service is running." || echo "⚠️  Bot service not running: sudo journalctl -u fxalexg-bot -n 50"
 fi
 
+[ "${SKIP_DEPLOY_KEY:-0}" = 1 ] && { log "Setup finished"; exit 0; }
 IP=$(curl -s -m 3 -H "Metadata-Flavor: Google" \
   "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip" 2>/dev/null || true)
 [ -n "$IP" ] || IP="<this server's external IP>"

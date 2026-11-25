@@ -55,9 +55,12 @@ jobs:
           export WINEPREFIX=$HOME/.wine_exness WINEDEBUG=-all DISPLAY=:99
           PY="$WINEPREFIX/drive_c/Program Files/Python39/python.exe"
           cat > /tmp/check.py <<'PY'
-          import time, MetaTrader5 as mt5
+          import os, time, MetaTrader5 as mt5
+          cands = [r"C:\Program Files\MetaTrader 5 EXNESS\terminal64.exe", r"C:\Program Files\MetaTrader 5\terminal64.exe"]
+          path = next(p for p in cands if os.path.exists(p))   # same order mt5_bridge.py uses
+          print("terminal path:", path)
           t0 = time.time()
-          ok = mt5.initialize(path=r"C:\Program Files\MetaTrader 5\terminal64.exe", timeout=180000)
+          ok = mt5.initialize(path=path, timeout=180000)
           print("initialize:", ok, "after", round(time.time() - t0), "s", mt5.last_error())
           if ok:
               ti = mt5.terminal_info()
@@ -82,3 +85,39 @@ jobs:
           cd "$HOME/fxalexg_bot"
           .venv/bin/python test_momentum.py
           .venv/bin/python test_monitor.py
+
+  gcp-startup:
+    # The Google Cloud "server sets itself up" mode: startup script run as root with metadata values.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run deploy/gcp_startup.sh as root (fake account in place of VM metadata)
+        run: |
+          sudo env META_MT5_LOGIN=12345678 META_MT5_PASSWORD='p@ss word$1' META_MT5_SERVER=Exness-MT5Trial9 \
+            META_TELEGRAM_TOKEN=000000:not-a-real-token META_MOMENTUM_TELEGRAM_TOKEN=111111:not-real \
+            META_BRANCH="${{ github.ref_name }}" SETUP_SCRIPT_PATH="$PWD/deploy/setup_server.sh" \
+            bash deploy/gcp_startup.sh
+
+      - name: Bot runs as user "trader", secrets stored privately, auto-update timer on
+        run: |
+          set -euo pipefail
+          id trader
+          sudo test -f /home/trader/fxalexg_bot/.env
+          [ "$(sudo stat -c '%a %U' /home/trader/fxalexg_bot/.env)" = "600 trader" ]
+          sudo grep -q "^MT5_DEMO_PASSWORD=p@ss word\$1$" /home/trader/fxalexg_bot/.env
+          sudo grep -q "^MOMENTUM_TELEGRAM_TOKEN=111111:not-real$" /home/trader/fxalexg_bot/.env.monitor
+          ! sudo ls /home/trader/.ssh/github_deploy 2>/dev/null
+          systemctl is-active xvfb
+          systemctl is-enabled mt5-bridge fxalexg-bot fxalexg-update.timer
+          systemctl is-active fxalexg-update.timer
+          sudo -u trader -H /usr/local/bin/fxalexg-update; echo "updater exit: $?"
+
+      - name: Second boot is quick and keeps working
+        run: |
+          start=$(date +%s)
+          sudo env META_MT5_LOGIN=12345678 META_MT5_PASSWORD='p@ss word$1' META_MT5_SERVER=Exness-MT5Trial9 \
+            META_TELEGRAM_TOKEN=000000:not-a-real-token META_BRANCH="${{ github.ref_name }}" \
+            SETUP_SCRIPT_PATH="$PWD/deploy/setup_server.sh" bash deploy/gcp_startup.sh
+          echo "second run took $(( $(date +%s) - start )) s"
