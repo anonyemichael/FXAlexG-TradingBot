@@ -16,6 +16,7 @@ MT5 login: /login in Telegram (stored encrypted), or GitHub secrets MT5_LOGIN / 
 Env: MT5_PATH, MT5_PORTABLE, MOMENTUM_TELEGRAM_TOKEN, MOMENTUM_TELEGRAM_CHAT_ID, MOMENTUM_RISK_PCT, MODE=live|dry
 """
 
+import copy
 import math
 import os
 import sys
@@ -316,6 +317,9 @@ def run(mt5, env, state, control=None, http=requests, now=None):
     now = pd.Timestamp(now) if now is not None else pd.Timestamp.now(tz="UTC")
     control = control or {}
     live = env.get("MODE", "live") == "live"
+    if not live:                # push "dry" checks work on a copy: they must not move the hourly clock,
+        state["last_dry_run"] = now.timestamp()            # hide closed-trade reports or change alerts
+        state = copy.deepcopy(state)
     token = env.get("MOMENTUM_TELEGRAM_TOKEN") or ""
     chat = str(env.get("MOMENTUM_TELEGRAM_CHAT_ID") or control.get("tg_chat")
                or getattr(config, "MOMENTUM_TELEGRAM_CHAT_ID", "") or "") or None

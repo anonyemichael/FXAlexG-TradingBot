@@ -215,7 +215,8 @@ def test_bad_login_alerts_once_per_6h():
 def test_dry_mode_never_trades_or_messages():
     mt5 = FakeMT5()
     code, state, http, out = _run(mt5, {**ENV, "MODE": "dry"}, control={"requests": [{"id": 1, "cmd": "status", "arg": "", "ts": 0}]})
-    assert code == 0 and not mt5.orders and not http.sent and "1 new entry" in out and not state["done"]
+    assert code == 0 and not mt5.orders and not http.sent and "1 new entry" in out
+    assert set(state) == {"last_dry_run"}                       # the real trading state is left alone
 
 
 def test_login_from_telegram_control_and_ask_once():
