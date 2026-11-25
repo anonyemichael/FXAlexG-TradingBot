@@ -138,6 +138,28 @@ def test_dispatch_failure_is_reported():
     assert any("Couldn't start a run" in t for t in texts(http))
 
 
+def test_main_saves_before_dispatch():
+    import tempfile
+    from cloud_common import load_json
+    d = tempfile.mkdtemp()
+    T.CONTROL_STATE, T.RUNNER_STATE = os.path.join(d, "ctl.json"), os.path.join(d, "run.json")
+    out = os.path.join(d, "out.txt")
+    T.config.MOMENTUM_TELEGRAM_CHAT_ID = "777"
+    fake = FakeHTTP([msg(1, 777, "/login 436015341 Pass@1 Exness-MT5Trial9", mid=9)])
+    T.requests = fake
+    old = dict(os.environ)
+    os.environ.update({"MOMENTUM_TELEGRAM_TOKEN": "tok", "LISTEN_SECONDS": "0", "GITHUB_OUTPUT": out})
+    try:
+        T.main()
+    finally:
+        os.environ.clear(); os.environ.update(old)
+    outputs = open(out).read()
+    assert "changed=true" in outputs and "dispatch=true" in outputs
+    assert not fake.dispatches                      # the workflow starts the run, after saving the cache
+    saved = load_json(T.CONTROL_STATE, "tok")
+    assert saved["creds"]["login"] == "436015341" and b"Pass@1" not in open(T.CONTROL_STATE, "rb").read()
+
+
 if __name__ == "__main__":
     tests = [v for k, v in dict(globals()).items() if k.startswith("test_")]
     for t in tests:

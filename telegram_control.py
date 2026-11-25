@@ -93,7 +93,17 @@ def dispatch(http, env, ctl, now):
     return ok
 
 
-def handle(http, env, ctl, run, now):
+def fetch_updates(http, token, ctl, wait=0):
+    params = {"timeout": int(wait)}
+    if ctl.get("tg_offset"):
+        params["offset"] = ctl["tg_offset"]
+    try:
+        return http.get(f"https://api.telegram.org/bot{token}/getUpdates", params=params, timeout=wait + 15).json()
+    except Exception:
+        return {}
+
+
+def handle(http, env, ctl, run, now, updates=None, dispatcher=None):
     """Process new Telegram messages. Returns True if control state changed."""
     token = env.get("MOMENTUM_TELEGRAM_TOKEN") or ""
     if not token:
@@ -114,13 +124,8 @@ def handle(http, env, ctl, run, now):
                       f"pending messages: {(info.get('result') or {}).get('pending_update_count')}")
         except Exception:
             pass
-    params = {"timeout": 0}
-    if ctl.get("tg_offset"):
-        params["offset"] = ctl["tg_offset"]
-    try:
-        updates = http.get(f"https://api.telegram.org/bot{token}/getUpdates", params=params, timeout=15).json()
-    except Exception:
-        updates = {}
+    if updates is None:
+        updates = fetch_updates(http, token, ctl)
     chat = str(env.get("MOMENTUM_TELEGRAM_CHAT_ID") or ctl.get("tg_chat")
                or getattr(config, "MOMENTUM_TELEGRAM_CHAT_ID", "") or "") or None
     need_run = False
@@ -143,7 +148,8 @@ def handle(http, env, ctl, run, now):
 
     if updates.get("ok") is False:
         print(f"Telegram refused the token: {updates.get('description', 'unknown error')}")
-    print(f"Telegram messages received: {len(updates.get('result', []))}")
+    if updates.get("result"):
+        print(f"Telegram messages received: {len(updates['result'])}")
     for u in updates.get("result", []):
         ctl["tg_offset"] = u["update_id"] + 1
         msg = u.get("message") or u.get("edited_message") or {}
@@ -225,9 +231,9 @@ def handle(http, env, ctl, run, now):
 
     pending = [r for r in ctl.get("requests", []) if now - r["ts"] < 6 * 3600]
     ctl["requests"] = pending
-    print(f"Requests waiting for a trading run: {len(pending)}")
     if need_run or (pending and now - ctl.get("last_dispatch", 0) > 15 * 60):
-        if dispatch(http, env, ctl, now):
+        print(f"Requests waiting for a trading run: {len(pending)}")
+        if (dispatcher or (lambda: dispatch(http, env, ctl, now)))():
             print("Trading run started.")
         else:
             print("Could not start a trading run.")
@@ -236,18 +242,37 @@ def handle(http, env, ctl, run, now):
 
 
 def main():
+    """Listen for up to LISTEN_SECONDS (long polling, replies within seconds). If a trading run is needed, stop
+    early so the workflow saves the settings first and then starts cloud-bot.yml (outputs: changed, dispatch)."""
     env = dict(os.environ)
     token = env.get("MOMENTUM_TELEGRAM_TOKEN") or ""
     ctl = load_json(CONTROL_STATE, token)
     run = load_json(RUNNER_STATE, token)
-    changed = handle(requests, env, ctl, run, time.time())
+    deadline = time.time() + float(env.get("LISTEN_SECONDS") or 0)
+    wanted = []
+
+    def record_dispatch():
+        if time.time() - ctl.get("last_dispatch", 0) < 60:
+            return True
+        wanted.append(True)
+        ctl["last_dispatch"] = time.time()
+        return True
+
+    changed = False
+    while True:
+        wait = max(0, min(25, deadline - time.time()))
+        updates = fetch_updates(requests, token, ctl, wait) if token else {}
+        changed |= handle(requests, env, ctl, run, time.time(), updates=updates, dispatcher=record_dispatch)
+        if wanted or time.time() >= deadline or not token:
+            break
     if changed:
         save_json(CONTROL_STATE, ctl, token)
     out = env.get("GITHUB_OUTPUT")
     if out:
         with open(out, "a") as f:
-            f.write(f"changed={'true' if changed else 'false'}\n")
-    print(f"Telegram check done ({'state changed' if changed else 'no changes'}).")
+            f.write(f"changed={'true' if changed else 'false'}\ndispatch={'true' if wanted else 'false'}\n")
+    print(f"Telegram check done ({'state changed' if changed else 'no changes'}"
+          f"{', starting a trading run' if wanted else ''}).")
     return 0
 
 
