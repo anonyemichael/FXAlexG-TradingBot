@@ -24,12 +24,15 @@ GitHub's cache, encrypted with your bot token, so nothing readable is stored in 
 | `/log` | what the last trading run did, line by line | ~5 min |
 | `/health` | last run, MT5 login, Algo Trading, last error | ~5 min |
 | `/filter` | Bitcoin trend filter (on = trading allowed) | ~5 min |
+| `/quiet` · `/verbose` | turn the hourly "checked, nothing new" note off / on | ~5 min |
 | `/status` | live balance, open trades, P&L | ~8 min |
 | `/trades` | last 10 closed trades | ~8 min |
 | `/run` | check for new trades now | ~8 min |
+| `/testtrade` | smallest possible trade on the cheapest coin, opened and closed at once (proves orders reach MT5; costs a few cents of spread) | ~8 min |
 | `/close SOLUSD` | close one trade at market | ~8 min |
 | `/closeall confirm` | close every momentum trade at market | ~8 min |
 | `/login …` · `/logout` | save / delete the MT5 login | ~5 min |
 
-You also get, without asking: every buy, stop raise and close, filter on/off changes, errors, and a daily
-summary at 07:00 UTC. GitHub's timers can run a few minutes late.
+You also get, without asking: every buy (with the reason: breakout level, Bitcoin filter, stop distance),
+every stop raise and close with P&L, filter on/off changes, errors, a one-line note after each hourly check
+(`/quiet` turns it off) and a daily summary at 07:00 UTC. One test trade runs automatically after setup. GitHub's timers can run a few minutes late.
