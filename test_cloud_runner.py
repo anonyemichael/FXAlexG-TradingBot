@@ -242,6 +242,57 @@ def test_testtrade_opens_and_closes_smallest_position():
     assert not C.Broker(mt5).positions()                    # test trade never counts as a momentum trade
 
 
+class ReadOnlyMT5(FakeMT5):
+    """Logged in with the investor password: every order is refused with 10017."""
+    def account_info(self): return NS(balance=10.0, equity=10.0, login=123, trade_allowed=False, trade_expert=True)
+
+    def order_send(self, req):
+        self.orders.append(req)
+        return NS(retcode=10017, comment="Trade disabled")
+
+
+class FxMT5(FakeMT5):
+    """SOL can't be bought on this account; EURUSD can."""
+    def symbol_info(self, s):
+        if s == "EURUSDm":
+            return NS(digits=5, point=0.00001, spread=10, trade_tick_size=0.00001, trade_tick_value=1.0, trade_mode=4,
+                      volume_min=0.01, volume_max=100.0, volume_step=0.01, filling_mode=1, trade_stops_level=0)
+        info = super().symbol_info(s)
+        if info and s == "SOLUSDm":
+            info.trade_mode = 0
+        return info
+
+    def symbol_info_tick(self, s):
+        return NS(time=int(NOW.timestamp()), bid=1.05, ask=1.05001) if s == "EURUSDm" else super().symbol_info_tick(s)
+
+
+def test_testtrade_readonly_login_is_explained():
+    mt5 = ReadOnlyMT5(breakout=False)
+    control = {"requests": [{"id": 7, "cmd": "testtrade", "arg": "", "ts": 0}]}
+    _, state, http, out = _run(mt5, control=control)
+    msg = next(t for t in http.sent if "Test trade failed" in t)
+    assert "read-only" in msg and "investor" in msg and "This login may trade: NO" in msg
+    assert "login may trade: NO" in out and "Algo Trading ON" in out and "rejected (code 10017)" in out
+    assert "123" not in out                                      # public log: still no account number
+    assert any("read-only" in t for t in http.sent if "Test trade" not in t)   # one-time alert too
+    assert "read-only" in state["health"]["trading"] and not mt5.closes
+
+
+def test_testtrade_skips_blocked_coin_and_falls_back_to_eurusd():
+    mt5 = FxMT5(breakout=False)
+    control = {"requests": [{"id": 8, "cmd": "testtrade", "arg": "", "ts": 0}]}
+    _, _, http, _ = _run(mt5, control=control)
+    assert [o["symbol"] for o in mt5.orders] == ["EURUSDm"] and len(mt5.closes) == 1
+    msg = next(t for t in http.sent if "test trade worked" in t)
+    assert "EURUSDm" in msg and "SOLUSDm (disabled)" in msg
+
+
+def test_breakout_on_blocked_coin_is_not_bought():
+    mt5 = FxMT5()
+    _, state, _, _ = _run(mt5)
+    assert not mt5.orders and any("disabled on this account" in l for l in state["log"])
+
+
 def test_hourly_note_and_quiet():
     env = {**ENV, "GITHUB_EVENT_NAME": "schedule"}
     _, _, http, _ = _run(FakeMT5(btc_up=False), env)

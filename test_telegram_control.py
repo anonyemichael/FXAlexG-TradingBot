@@ -49,7 +49,7 @@ def _go(updates, ctl=None, run=None, env=ENV, now=NOW, http=None, owner=None, he
     ctl = {} if ctl is None else ctl
     if not hello:
         ctl.setdefault("hello_sent", True)
-        ctl.setdefault("auto_test_done", True)
+        ctl.setdefault("auto_test_done", T.AUTO_TEST)
     http = http or FakeHTTP(updates)
     if updates and http.updates == []:
         http.updates = list(updates)
@@ -69,6 +69,13 @@ def test_hello_to_owner_once():
     assert ctl["hello_sent"] and ctl["tg_chat"] == "6220850396"
     _, ctl, http = _go([msg(1, 555, "/start")], ctl, owner="6220850396")   # stranger can't take over
     assert not http.sent and ctl["tg_chat"] == "6220850396"
+
+
+def test_auto_test_reruns_when_bumped():
+    _, ctl, http = _go([], {"tg_chat": "777", "hello_sent": True, "auto_test_done": True})
+    assert ctl["auto_test_done"] == T.AUTO_TEST and ctl["requests"][-1]["cmd"] == "testtrade" and http.dispatches
+    _, ctl, http = _go([], ctl, now=NOW + 300)
+    assert not http.dispatches                              # only once per version
 
 
 def test_claim_and_ignore_strangers():

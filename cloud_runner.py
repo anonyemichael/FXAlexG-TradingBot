@@ -53,9 +53,29 @@ class Broker:
             kw["path"] = path
         if portable:
             kw["portable"] = True      # settings (incl. Algo Trading on) live next to terminal64.exe
+            if path:
+                self._launch_with_algo_on(path)
         if not self.mt5.initialize(**kw):
             return False, str(self.mt5.last_error())
         return True, ""
+
+    @staticmethod
+    def _launch_with_algo_on(path):
+        """Start terminal64.exe ourselves with a startup config whose [Experts] section switches the
+        "Algo Trading" button on (Enabled=1) and keeps it on when the account changes (Account=0);
+        initialize() then attaches to this running terminal."""
+        import subprocess
+        import time
+        ini = os.path.join(os.path.dirname(path), "algo_on.ini")
+        body = ("[Experts]\r\nAllowLiveTrading=1\r\nAllowDllImport=0\r\nEnabled=1\r\n"
+                "Account=0\r\nProfile=0\r\n")
+        try:
+            with open(ini, "wb") as f:
+                f.write(b"\xff\xfe" + body.encode("utf-16-le"))
+            subprocess.Popen([path, "/portable", f"/config:{ini}"])
+            time.sleep(10)
+        except OSError:
+            pass
 
     def calibrate(self, symbol, now):
         """Trade-server clock minus UTC, whole hours (Exness is UTC+0, but don't assume it)."""
@@ -171,35 +191,100 @@ def filter_text(btc_d, now):
     return txt
 
 
+BUY_MODES = (1, 4)            # SYMBOL_TRADE_MODE_LONGONLY, SYMBOL_TRADE_MODE_FULL
+MODE_NAMES = {0: "disabled", 1: "long only", 2: "short only", 3: "close only", 4: "full"}
+
+
+def can_buy(info):
+    return getattr(info, "trade_mode", 4) in BUY_MODES
+
+
+def permissions(mt5):
+    """The three switches that must all be on for orders to go through (None = unknown)."""
+    term, acct = mt5.terminal_info(), mt5.account_info()
+    return {"algo": None if term is None else bool(getattr(term, "trade_allowed", True)),
+            "account": None if acct is None else bool(getattr(acct, "trade_allowed", True)),
+            "ea": None if acct is None else bool(getattr(acct, "trade_expert", True))}
+
+
+def _yn(v, yes="yes ✅", no="NO ❌"):
+    return "unknown" if v is None else (yes if v else no)
+
+
 def test_trade(mt5, br, syms, note):
-    """Open the smallest possible position on the cheapest available coin and close it straight away,
-    to prove orders really execute. Returns the Telegram text."""
-    best = None
+    """Open the smallest possible position and close it straight away, to prove orders really execute.
+    Tries up to 3 coins (cheapest first) and then EURUSD; if all are refused, explains why.
+    Returns the Telegram text."""
+    perm = permissions(mt5)
+    cands, blocked = [], []
     for sym in [s for s in syms.values() if s]:
         info, tick = mt5.symbol_info(sym), mt5.symbol_info_tick(sym)
         if not info or not tick:
             continue
-        notional = info.volume_min * getattr(info, "trade_contract_size", 1.0) * tick.ask
-        if best is None or notional < best[0]:
-            best = (notional, sym, info, tick)
-    if not best:
-        return "❌ Test trade: none of the coins is available on this account."
-    _, sym, info, tick = best
-    ok, code, msg = br.buy(sym, info.volume_min, tick.ask * 0.95, "TEST", magic=MAGIC_TEST)
-    note(f"Test trade BUY {sym} {info.volume_min}: {'ok' if ok else f'FAILED {code} {msg}'}")
-    log(f"Test order: {'opened' if ok else f'rejected (code {code})'}.")       # public log: no symbol/size/price
-    if not ok:
-        return (f"❌ <b>Test trade failed</b> on {sym}: broker said {code} {msg}.\n"
-                "Common causes: 10027 = Algo Trading off, 10018 = market closed, 10019 = not enough money.")
-    pos = next((p for p in (mt5.positions_get() or []) if p.magic == MAGIC_TEST and p.symbol == sym), None)
-    if pos is None:
-        return f"⚠️ Test BUY {sym} was accepted but no open position was found. Check MT5."
-    ok2, code2, msg2 = br.close(pos)
-    note(f"Test trade CLOSE {sym}: {'ok' if ok2 else f'FAILED {code2} {msg2}'}")
-    log(f"Test order: {'closed' if ok2 else f'close rejected (code {code2})'}.")
-    return (f"✅ <b>MT5 test trade worked</b>\nBought {info.volume_min} lot {sym} at ~{tick.ask:.6g} "
-            f"(ticket #{pos.ticket}) and {'closed it again' if ok2 else f'could NOT close it ({code2} {msg2}) — close it in MT5'}.\n"
-            "Cost: about one spread. The bot can place and close real orders on your account.")
+        if not can_buy(info):
+            blocked.append(f"{sym} ({MODE_NAMES.get(getattr(info, 'trade_mode', None), 'unknown')})")
+            continue
+        cands.append((info.volume_min * getattr(info, "trade_contract_size", 1.0) * tick.ask, sym))
+    order = [s for _, s in sorted(cands)][:3]
+    fx = br.resolve("EURUSDm")
+    if fx and fx not in order:
+        order.append(fx)
+    fails = []
+    for sym in order:
+        info, tick = mt5.symbol_info(sym), mt5.symbol_info_tick(sym)
+        if not info or not tick:
+            continue
+        ok, code, msg = br.buy(sym, info.volume_min, tick.ask * 0.95, "TEST", magic=MAGIC_TEST)
+        note(f"Test trade BUY {sym} {info.volume_min}: {'ok' if ok else f'FAILED {code} {msg}'}")
+        log(f"Test order: {'opened' if ok else f'rejected (code {code})'}.")       # public log: no symbol/size/price
+        if not ok:
+            fails.append((sym, code, msg))
+            continue
+        pos = next((p for p in (mt5.positions_get() or []) if p.magic == MAGIC_TEST and p.symbol == sym), None)
+        if pos is None:
+            return f"⚠️ Test BUY {sym} was accepted but no open position was found. Check MT5."
+        ok2, code2, msg2 = br.close(pos)
+        note(f"Test trade CLOSE {sym}: {'ok' if ok2 else f'FAILED {code2} {msg2}'}")
+        log(f"Test order: {'closed' if ok2 else f'close rejected (code {code2})'}.")
+        txt = (f"✅ <b>MT5 test trade worked</b>\nBought {info.volume_min} lot {sym} at ~{tick.ask:.6g} "
+               f"(ticket #{pos.ticket}) and {'closed it again' if ok2 else f'could NOT close it ({code2} {msg2}) — close it in MT5'}.\n"
+               "Cost: about one spread. The bot can place and close real orders on your account.")
+        if fails:
+            txt += "\n\nRefused first: " + "; ".join(f"{s} ({c} {m})" for s, c, m in fails)
+        if blocked:
+            txt += "\nNot tradable on this account (skipped by the bot): " + ", ".join(blocked)
+        return txt
+
+    lines = ["❌ <b>Test trade failed</b> — the broker refused every order."]
+    lines += [f"• {s}: {c} {m}" for s, c, m in fails]
+    if blocked:
+        lines.append("Not tradable on this account: " + ", ".join(blocked))
+    lines += ["", "<b>Checks</b>",
+              f"Algo Trading in MT5: {_yn(perm['algo'], 'ON ✅', 'OFF ❌')}",
+              f"This login may trade: {_yn(perm['account'])}",
+              f"Broker allows API/EA trading: {_yn(perm['ea'])}", ""]
+    codes = {c for _, c, _ in fails}
+    if perm["account"] is False:
+        lines.append("👉 This login is <b>read-only</b>. That is what happens with the <b>investor</b> password. "
+                     "Send <code>/login ACCOUNT TRADING_PASSWORD SERVER</code> with the <b>trading</b> password "
+                     "(Exness Personal Area → your account → ⚙️ → Change trading password if you don't know it).")
+    elif perm["algo"] is False or 10027 in codes:
+        lines.append("👉 Algo Trading is off in the terminal. The bot switches it on at every start; "
+                     "if this repeats, tell Claude.")
+    elif perm["ea"] is False or 10026 in codes:
+        lines.append("👉 The broker has disabled automated trading on this account. Open a new MT5 account "
+                     "in the Exness Personal Area and send /login with it.")
+    elif 10018 in codes:
+        lines.append("👉 Market closed for these symbols right now — try /testtrade again later.")
+    elif 10019 in codes:
+        lines.append("👉 Not enough free margin for even the smallest order.")
+    elif 10017 in codes:
+        lines.append("👉 The server says trading is disabled for this account (e.g. an archived/expired demo "
+                     "or an account type without these symbols). Open a new MT5 account (Standard) in the "
+                     "Exness Personal Area and send /login with it.")
+    elif not order:
+        lines.append("👉 None of the coins can be bought on this account.")
+    return "\n".join(lines)
 
 
 def run(mt5, env, state, control=None, http=requests, now=None):
@@ -255,11 +340,27 @@ def run(mt5, env, state, control=None, http=requests, now=None):
     first_login = health.get("login") != "ok"
     health.update(login="ok", error=None)
 
-    term = mt5.terminal_info()
-    health["algo"] = "on" if (term is None or term.trade_allowed) else "OFF — orders may be rejected"
-    if live and term is not None and not term.trade_allowed and not state.get("algo_alert"):
-        notify("⚠️ MT5 reports Algo Trading is disabled; orders may be rejected.")
+    perm = permissions(mt5)
+    log(f"Algo Trading {_yn(perm['algo'], 'ON', 'OFF')} · login may trade: {_yn(perm['account'], 'yes', 'NO')}"
+        f" · broker allows API trading: {_yn(perm['ea'], 'yes', 'NO')}.")        # no account data
+    health["algo"] = "on" if perm["algo"] is not False else "OFF — orders will be rejected"
+    health["trading"] = ("allowed" if perm["account"] is not False else
+                         "NOT allowed — read-only login (investor password?)")
+    if perm["ea"] is False:
+        health["trading"] += " · broker disabled API/EA trading"
+    if live and perm["algo"] is False and not state.get("algo_alert"):
+        notify("⚠️ MT5 reports Algo Trading is OFF on the cloud terminal; orders will be rejected. "
+               "The bot switches it on at every start — if this repeats, tell Claude.")
         state["algo_alert"] = True
+    elif perm["algo"]:
+        state.pop("algo_alert", None)
+    if live and perm["account"] is False and not state.get("readonly_alert"):
+        notify("⚠️ <b>This MT5 login is read-only</b> — every order will be refused (10017). That is what "
+               "happens with the <b>investor</b> password. Send <code>/login ACCOUNT TRADING_PASSWORD SERVER</code> "
+               "with the trading password.")
+        state["readonly_alert"] = True
+    elif perm["account"]:
+        state.pop("readonly_alert", None)
 
     syms = {s: br.resolve(s) for s in getattr(config, "MOMENTUM_SYMBOLS", [])}
     missing = [s for s, v in syms.items() if not v]
@@ -367,6 +468,10 @@ def run(mt5, env, state, control=None, http=requests, now=None):
                     note(f"{sym} {label}: breakout already traded")
                     continue
                 info, tick = mt5.symbol_info(sym), mt5.symbol_info_tick(sym)
+                if not can_buy(info):
+                    note(f"{sym} {label}: breakout, but buying {sym} is "
+                         f"{MODE_NAMES.get(getattr(info, 'trade_mode', None), 'not allowed')} on this account")
+                    continue
                 if info.spread * info.point > getattr(config, "MOMENTUM_MAX_SPREAD_FRAC", 0.15) * setup["sl_dist"]:
                     note(f"{sym} {label}: breakout skipped, spread too wide")
                     events.append(f"🛰️ {sym} breakout skipped: spread too wide for the stop")
@@ -429,7 +534,8 @@ def run(mt5, env, state, control=None, http=requests, now=None):
                                            f"{health['open']} open trade(s). /log for details."))
             done.append(r["id"])
         if first_login and creds:
-            notify(f"✅ <b>Logged in to MT5</b> ({login} on {server}).\n\n" + status())
+            if notify(f"✅ <b>Logged in to MT5</b> ({login} on {server}).\n\n" + status()):
+                state["summary_day"] = now.strftime("%Y-%m-%d")       # that was today's summary
         if events:
             notify("\n\n".join(events))
         elif env.get("GITHUB_EVENT_NAME") == "schedule" and control.get("verbose", True):

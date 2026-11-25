@@ -50,6 +50,9 @@ def log_text(run, now):
             + "\n".join(lines[-40:]))
 
 
+AUTO_TEST = 2                # bump to make the listener run /testtrade once more by itself
+
+
 def health_text(run, ctl, now):
     h = run.get("health") or {}
     age = (now - run["last_run"]) / 3600 if run.get("last_run") else None
@@ -58,6 +61,7 @@ def health_text(run, ctl, now):
             f"Last run: {_ago(run.get('last_run'), now)} — {run.get('result', 'none yet')}\n"
             f"MT5 login: {h.get('login', 'unknown')}\n"
             f"Algo Trading: {h.get('algo', 'unknown')}\n"
+            f"Orders: {h.get('trading', 'unknown')}\n"
             f"Open trades: {h.get('open', '?')} · Balance: {h.get('balance', '?')}\n"
             f"Last error: {h.get('error') or 'none'}\n"
             f"New trades: {'paused' if ctl.get('paused') else 'on'}" + warn)
@@ -151,13 +155,14 @@ def handle(http, env, ctl, run, now, updates=None, dispatcher=None):
         print(f"Telegram refused the token: {updates.get('description', 'unknown error')}")
     if updates.get("result"):
         print(f"Telegram messages received: {len(updates['result'])}")
-    if chat and ctl.get("hello_sent") and not ctl.get("auto_test_done"):
-        # one-time check after setup: a tiny trade opened and closed at once proves MT5 orders execute
-        ctl["auto_test_done"] = True
+    if chat and ctl.get("hello_sent") and ctl.get("auto_test_done") != AUTO_TEST:
+        # automatic check after setup (bumped when the check improves): a tiny trade opened and closed at once
+        ctl["auto_test_done"] = AUTO_TEST
         queue("testtrade")
         need_run = True
-        reply("🧪 Running a one-time test trade (smallest size, opened and closed at once) to prove "
-              "orders reach MT5. Result in ~3 minutes.")
+        reply("🧪 Running the test trade again: MT5 now starts with Algo Trading forced on, and the bot checks "
+              "every permission (Algo Trading, login, broker) and tries other coins and EURUSD. "
+              "Result in ~3 minutes.")
     for u in updates.get("result", []):
         ctl["tg_offset"] = u["update_id"] + 1
         msg = u.get("message") or u.get("edited_message") or {}
