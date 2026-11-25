@@ -10,6 +10,7 @@ v3.1 Upgrades:
   - Adaptive crypto/forex stop loss sizing
 """
 
+import os
 import time
 import json
 import traceback
@@ -32,6 +33,7 @@ import trend_strategy
 import swing_strategy
 import alexg_strategy
 import momentum_strategy
+import monitor_bot
 
 ACCOUNT_WIZARDS = {}  # {chat_id: {"step": "...", "server": "...", "login": 123, ...}}
 
@@ -625,7 +627,7 @@ def _spread_vs_stop_ok(symbol, sl_dist, max_frac):
 def _last_closed_4h():
     """Open time of the 4H candle that closed most recently (UTC-aligned, as on Exness server time)."""
     now = datetime.now(timezone.utc)
-    return str(pd.Timestamp(now).floor("4h") - pd.Timedelta(hours=4))
+    return str(pd.Timestamp(now).floor(pd.Timedelta(hours=4)) - pd.Timedelta(hours=4))
 
 
 def run_swing_scan():
@@ -748,7 +750,7 @@ def _momentum_regime():
 def _expected_candle(engine):
     hrs = momentum_strategy.ENGINES[engine]["tf_hours"]
     now = pd.Timestamp(datetime.now(timezone.utc))
-    return str(now.floor(f"{hrs}h" if hrs < 24 else "1D") - pd.Timedelta(hours=hrs))
+    return str(now.floor(pd.Timedelta(hours=hrs)) - pd.Timedelta(hours=hrs))
 
 
 def _momentum_bars(symbol, engine):
@@ -977,6 +979,89 @@ def run_scan(kill_zone=None):
         open_trades = len(bridge.get_positions() or [])
         day_count = trade_logger.get_daily_trade_count()
         notifier.send_scan_summary(pairs_scanned, setups_found, open_trades, day_count)
+
+
+# ── Momentum monitor bot (separate Telegram bot, see monitor_bot.py) ─────────
+
+def _momentum_accounts():
+    return [a for a in account_manager.get_active_accounts() if (a.get("strategy") or "trend") == "momentum"]
+
+
+def _momentum_trade_rows(limit=None, status=None):
+    conn = trade_logger._conn()
+    conn.row_factory = __import__("sqlite3").Row
+    q = ("SELECT opened_at, closed_at, symbol, entry, sl, lot, risk_usd, result_usd, status, trigger, login, ticket "
+         "FROM trades WHERE trigger IN ('mom_4h', 'mom_d1')")
+    args = []
+    if status:
+        q += " AND status = ?"; args.append(status)
+    q += " ORDER BY id DESC"
+    if limit:
+        q += f" LIMIT {int(limit)}"
+    rows = [dict(r) for r in conn.execute(q, args).fetchall()]
+    conn.close()
+    return rows
+
+
+def _monitor_filter_text():
+    df = dp.get_daily(getattr(config, "MOMENTUM_REGIME_SYMBOL", "BTCUSDm"), count=300)
+    closed = momentum_strategy.closed_bars(df, 24) if df is not None else None
+    if closed is None or len(closed) < 120:
+        return "🛰️ Market filter: BTC daily data unavailable from the bridge right now."
+    c = closed["close"]
+    e = c.ewm(span=momentum_strategy.REGIME_EMA, adjust=False).mean()
+    last, ema = float(c.iloc[-1]), float(e.iloc[-1])
+    on = last > ema
+    txt = (f"🛰️ <b>Market filter {'ON ✅' if on else 'OFF ⏸️'}</b>\n"
+           f"BTC close {closed.index[-1].strftime('%d %b')}: <b>{last:,.0f}</b>\n"
+           f"EMA{momentum_strategy.REGIME_EMA}: <b>{ema:,.0f}</b> ({(last / ema - 1) * 100:+.1f}%)\n")
+    if on:
+        txt += "Breakouts on SOL/XRP/DOGE/ADA/BNB/ETH/BTC are being traded."
+    else:
+        txt += f"No new buys until BTC closes above ~{ema:,.0f} (+{(ema / last - 1) * 100:.1f}% from here)."
+    return txt
+
+
+def _monitor_status_text():
+    accs = _momentum_accounts()
+    lines = ["🛰️ <b>Momentum Breakout — status</b>"]
+    if not accs:
+        lines.append("No active account is on the momentum method. Use /strategy &lt;login&gt; momentum in the main bot.")
+    for a in accs:
+        lines.append(f"• #{a['login']} {a.get('label') or ''}: balance <b>${float(a.get('balance') or 0):.2f}</b>, "
+                     f"risk {a.get('risk_pct')}%/trade")
+    open_rows = _momentum_trade_rows(status="open")
+    lines.append(f"\n<b>Open trades: {len(open_rows)}</b>")
+    for r in open_rows:
+        eng = momentum_strategy.ENGINES.get(r["trigger"], {}).get("label", r["trigger"])
+        lines.append(f"• {r['symbol']} ({eng}) #{r['ticket']} entry {r['entry']:.6g}, risk ${float(r['risk_usd'] or 0):.2f}")
+    closed = _momentum_trade_rows(status="closed")
+    week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    wk = [r for r in closed if (r["closed_at"] or "") >= week_ago and r["result_usd"] is not None]
+    allc = [r for r in closed if r["result_usd"] is not None]
+    if allc:
+        wins = sum(1 for r in allc if r["result_usd"] > 0)
+        lines.append(f"\nLast 7 days: {len(wk)} closed, <b>${sum(r['result_usd'] for r in wk):+.2f}</b>")
+        lines.append(f"All time: {len(allc)} closed, {wins} wins, <b>${sum(r['result_usd'] for r in allc):+.2f}</b>")
+    else:
+        lines.append("\nNo closed momentum trades yet.")
+    lines.append("\n" + _monitor_filter_text())
+    return "\n".join(lines)
+
+
+def _monitor_trades_text():
+    rows = _momentum_trade_rows(limit=10)
+    if not rows:
+        return "🛰️ No momentum trades yet."
+    out = ["🛰️ <b>Last momentum trades</b>"]
+    for r in rows:
+        eng = momentum_strategy.ENGINES.get(r["trigger"], {}).get("label", r["trigger"])
+        res = "open" if r["status"] == "open" else (f"${r['result_usd']:+.2f}" if r["result_usd"] is not None else "?")
+        out.append(f"• {(r['opened_at'] or '')[:10]} {r['symbol']} ({eng}) #{r['login']}: <b>{res}</b>")
+    return "\n".join(out)
+
+
+MONITOR_HANDLERS = {"/status": _monitor_status_text, "/trades": _monitor_trades_text, "/filter": _monitor_filter_text}
 
 
 def _send_welcome_menu(chat_id=None):
@@ -1646,6 +1731,12 @@ def main():
     last_scan_slot  = (-1, -1)
     last_trend_slot = None
     last_h4_slot    = None
+    last_monitor_poll = 0.0
+    last_monitor_day  = None
+    if monitor_bot.enabled():
+        commit = os.environ.get("DEPLOY_COMMIT", "")[:7]
+        monitor_bot.send(f"🛰️ <b>Momentum monitor online</b>{' — build ' + commit if commit else ''}\n"
+                         f"Send /status, /trades or /filter.")
     last_other_check = 0.0
     last_ema_check  = 0.0
     weekly_report_sent = False
@@ -1663,6 +1754,19 @@ def main():
             if time.time() - last_cmd_check >= 5:
                 handle_telegram_commands()
                 last_cmd_check = time.time()
+
+            # Momentum monitor bot: commands every 10s, one summary a day
+            if monitor_bot.enabled():
+                if time.time() - last_monitor_poll >= 10:
+                    monitor_bot.poll(MONITOR_HANDLERS)
+                    last_monitor_poll = time.time()
+                today = now.strftime("%Y-%m-%d")
+                if h == getattr(config, "MONITOR_DAILY_HOUR", 7) and last_monitor_day != today:
+                    last_monitor_day = today
+                    try:
+                        monitor_bot.send("☀️ <b>Daily summary</b>\n\n" + _monitor_status_text())
+                    except Exception as e:
+                        print(f"[{_ts()}] Monitor daily summary error: {e}")
 
             # Manage open positions (TP1, Trailing SL, TTL) every 15s
             if time.time() - last_tp_check >= 15:

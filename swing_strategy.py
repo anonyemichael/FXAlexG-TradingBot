@@ -89,7 +89,7 @@ def manage(df_4h, opened_at, current_sl, now=None):
     opened = pd.Timestamp(opened_at)
     if opened.tzinfo is None:
         opened = opened.tz_localize("UTC")
-    lvl = trail_level(closed_bars(df_4h, 4, now), opened.floor("4h"))
+    lvl = trail_level(closed_bars(df_4h, 4, now), opened.floor(pd.Timedelta(hours=4)))
     if lvl is not None and lvl > (current_sl or 0):
         return "trail", lvl
     return None, None

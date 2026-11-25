@@ -2,11 +2,11 @@ import os
 from pathlib import Path
 
 # --- Secure Environment Loader ---
-def _load_dotenv():
+def _load_dotenv(name=".env"):
     """Load .env key-value pairs into os.environ if present without requiring external libraries."""
     search_paths = [
-        Path(__file__).resolve().parent / ".env",
-        Path.cwd() / ".env"
+        Path(__file__).resolve().parent / name,
+        Path.cwd() / name
     ]
     for p in search_paths:
         if p.is_file():
@@ -32,10 +32,16 @@ def _safe_int(val, default=0):
         return default
 
 _load_dotenv()
+_load_dotenv(".env.monitor")   # written by .github/workflows/deploy.yml from GitHub secrets
 
 # --- Credentials & Endpoints (Loaded securely from environment / .env) ---
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or None  # Auto-discovered via /start or loaded from chat_id.json
+
+# Separate Telegram bot for the Momentum Breakout strategy (monitor_bot.py). Optional.
+MOMENTUM_TELEGRAM_TOKEN   = os.getenv("MOMENTUM_TELEGRAM_TOKEN", "")
+MOMENTUM_TELEGRAM_CHAT_ID = os.getenv("MOMENTUM_TELEGRAM_CHAT_ID") or None
+MONITOR_DAILY_HOUR        = 7      # UTC hour of the daily momentum summary
 
 # MT5 Bridge URL
 BRIDGE_URL = os.getenv("BRIDGE_URL", "http://localhost:5001")

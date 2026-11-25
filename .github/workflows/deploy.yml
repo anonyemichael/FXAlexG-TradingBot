@@ -1,0 +1,191 @@
+# Tests every push, then deploys the bot code to the VPS over SSH and restarts it.
+#
+# One-time setup: GitHub repo -> Settings -> Secrets and variables -> Actions -> New repository secret
+#   VPS_HOST                   required for deploy: VPS IP or hostname (no secret = tests only, no deploy)
+#   VPS_SSH_KEY                required for deploy: private SSH key that can log in to the VPS
+#   VPS_USER                   optional, default "ubuntu"
+#   VPS_PORT                   optional, default 22
+#   VPS_KNOWN_HOSTS            optional, output of `ssh-keyscan -H <host>` (pins the host key; otherwise scanned)
+#   BOT_DIR                    optional, default /home/ubuntu/fxalexg_bot
+#   BOT_SERVICE                optional, default fxalexg-bot
+#   MOMENTUM_TELEGRAM_TOKEN    optional: token of the separate momentum monitor bot (from @BotFather)
+#   MOMENTUM_TELEGRAM_CHAT_ID  optional: your chat id for it (otherwise the first /start claims the bot)
+#
+# What a deploy does on the VPS:
+#   1. checks BOT_DIR/.env holds TELEGRAM_TOKEN (the code reads all credentials from .env)
+#   2. copies BOT_DIR to BOT_DIR_deploy_backup_<time> (keeps the last 5)
+#   3. copies the repo's *.py and *.md files (never .env, databases, account/chat state, or mt5_bridge.py)
+#   4. writes BOT_DIR/.env.monitor from the MOMENTUM_* secrets (mode 600)
+#   5. restarts the service; if it isn't running cleanly 40 s later, restores the backup code and restarts again
+name: Test and deploy to VPS
+
+on:
+  push:
+    branches: [main, ccr-40ef48ac-4webyc]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-vps
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install dependencies
+        run: pip install pandas numpy requests
+      - name: Byte-compile everything
+        run: python -m py_compile *.py
+      - name: Momentum strategy tests
+        run: python test_momentum.py
+      - name: Monitor bot tests
+        run: python test_monitor.py
+      - name: Swing / Set & Forget tests
+        run: python test_swing_alexg.py
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    env:
+      VPS_HOST: ${{ secrets.VPS_HOST }}
+      VPS_USER: ${{ secrets.VPS_USER }}
+      VPS_PORT: ${{ secrets.VPS_PORT }}
+      BOT_DIR: ${{ secrets.BOT_DIR }}
+      BOT_SERVICE: ${{ secrets.BOT_SERVICE }}
+    steps:
+      - name: Check deploy secrets
+        id: gate
+        run: |
+          if [ -z "$VPS_HOST" ]; then
+            echo "VPS_HOST secret is not set: tests passed, nothing deployed." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.go == 'true'
+
+      - name: Set up SSH
+        if: steps.gate.outputs.go == 'true'
+        env:
+          SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SSH_KEY" ]; then echo "::error::VPS_SSH_KEY secret is not set"; exit 1; fi
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
+          if [ -n "$KNOWN_HOSTS" ]; then
+            printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          else
+            ssh-keyscan -p "${VPS_PORT:-22}" -H "$VPS_HOST" > ~/.ssh/known_hosts 2>/dev/null
+          fi
+          chmod 600 ~/.ssh/known_hosts
+          {
+            echo "Host vps"
+            echo "  HostName $VPS_HOST"
+            echo "  User ${VPS_USER:-ubuntu}"
+            echo "  Port ${VPS_PORT:-22}"
+            echo "  IdentityFile ~/.ssh/deploy_key"
+            echo "  StrictHostKeyChecking yes"
+            echo "  ConnectTimeout 20"
+          } > ~/.ssh/config
+          ssh vps true
+
+      - name: Pre-flight check and backup on the VPS
+        if: steps.gate.outputs.go == 'true'
+        run: |
+          set -euo pipefail
+          ssh vps bash -s -- "${BOT_DIR:-/home/ubuntu/fxalexg_bot}" "$(date -u +%Y%m%d_%H%M%S)" <<'REMOTE'
+          set -euo pipefail
+          BOT_DIR="$1"; STAMP="$2"
+          if [ ! -d "$BOT_DIR" ]; then echo "::error::Bot folder $BOT_DIR not found on the VPS (set the BOT_DIR secret)"; exit 1; fi
+          cd "$BOT_DIR"
+          if ! grep -Eq '^TELEGRAM_TOKEN=.+' .env 2>/dev/null; then
+            echo "::error::$BOT_DIR/.env has no TELEGRAM_TOKEN. This code reads every credential from .env;"
+            echo "::error::copy .env.example to .env on the VPS and fill it in (keep your current config.py values) before deploying."
+            exit 1
+          fi
+          if ! grep -Eq '^MT5_(DEMO|REAL)_LOGIN=[1-9][0-9]*' .env; then
+            echo "::error::$BOT_DIR/.env has no MT5_DEMO_LOGIN / MT5_REAL_LOGIN. The new config.py reads the master"
+            echo "::error::MT5 account from .env; add it (see .env.example) so the deploy doesn't lose it."
+            exit 1
+          fi
+          cp -a "$BOT_DIR" "${BOT_DIR}_deploy_backup_${STAMP}"
+          echo "${BOT_DIR}_deploy_backup_${STAMP}" > "$BOT_DIR/.last_deploy_backup"
+          ls -d "${BOT_DIR}"_deploy_backup_* 2>/dev/null | sort | head -n -5 | xargs -r rm -rf
+          echo "Backup: ${BOT_DIR}_deploy_backup_${STAMP}"
+          REMOTE
+
+      - name: Copy code to the VPS
+        if: steps.gate.outputs.go == 'true'
+        run: |
+          set -euo pipefail
+          FILES=$(git ls-files '*.py' '*.md' .env.example | grep -v -x 'mt5_bridge.py' | grep -v '/')
+          echo "Deploying $(echo "$FILES" | wc -l) files at ${GITHUB_SHA::7}"
+          tar czf - $FILES | ssh vps "tar xzf - -C '${BOT_DIR:-/home/ubuntu/fxalexg_bot}'"
+
+      - name: Write monitor bot settings
+        if: steps.gate.outputs.go == 'true'
+        env:
+          MOMENTUM_TELEGRAM_TOKEN: ${{ secrets.MOMENTUM_TELEGRAM_TOKEN }}
+          MOMENTUM_TELEGRAM_CHAT_ID: ${{ secrets.MOMENTUM_TELEGRAM_CHAT_ID }}
+        run: |
+          set -euo pipefail
+          umask 077
+          {
+            if [ -n "$MOMENTUM_TELEGRAM_TOKEN" ]; then echo "MOMENTUM_TELEGRAM_TOKEN=$MOMENTUM_TELEGRAM_TOKEN"; fi
+            if [ -n "$MOMENTUM_TELEGRAM_CHAT_ID" ]; then echo "MOMENTUM_TELEGRAM_CHAT_ID=$MOMENTUM_TELEGRAM_CHAT_ID"; fi
+            echo "DEPLOY_COMMIT=$GITHUB_SHA"
+          } > env.monitor
+          ssh vps "umask 077; cat > '${BOT_DIR:-/home/ubuntu/fxalexg_bot}/.env.monitor'" < env.monitor
+          rm -f env.monitor
+          if [ -z "$MOMENTUM_TELEGRAM_TOKEN" ]; then
+            echo "MOMENTUM_TELEGRAM_TOKEN not set: momentum messages stay on the main bot." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Restart and health check (auto-rollback)
+        if: steps.gate.outputs.go == 'true'
+        run: |
+          set -euo pipefail
+          ssh vps bash -s -- "${BOT_DIR:-/home/ubuntu/fxalexg_bot}" "${BOT_SERVICE:-fxalexg-bot}" <<'REMOTE'
+          set -uo pipefail
+          BOT_DIR="$1"; SERVICE="$2"; BACKUP="$(cat "$BOT_DIR/.last_deploy_backup")"
+          before=$(systemctl show -p NRestarts --value "$SERVICE" 2>/dev/null || echo 0)
+          started=$(date '+%Y-%m-%d %H:%M:%S')
+          sudo systemctl restart "$SERVICE"
+          sleep 40
+          after=$(systemctl show -p NRestarts --value "$SERVICE" 2>/dev/null || echo 0)
+          errors=$(sudo journalctl -u "$SERVICE" --since "$started" --no-pager 2>/dev/null \
+                   | grep -E "SyntaxError|ImportError|ModuleNotFoundError|NameError|IndentationError" || true)
+          if systemctl is-active --quiet "$SERVICE" && [ "$before" = "$after" ] && [ -z "$errors" ]; then
+            echo "✅ $SERVICE is running the new code."
+            sudo journalctl -u "$SERVICE" --since "$started" --no-pager | tail -n 15
+            exit 0
+          fi
+          echo "::error::$SERVICE did not start cleanly — rolling back to $BACKUP"
+          [ -n "$errors" ] && echo "$errors"
+          sudo journalctl -u "$SERVICE" --since "$started" --no-pager | tail -n 40
+          rsync -a --exclude='*.db' --exclude='*.json' --exclude='.env*' "$BACKUP"/ "$BOT_DIR"/ 2>/dev/null \
+            || (cd "$BACKUP" && tar cf - --exclude='*.db' --exclude='*.json' --exclude='.env*' . | tar xf - -C "$BOT_DIR")
+          sudo systemctl restart "$SERVICE"
+          sleep 10
+          systemctl is-active "$SERVICE" || true
+          exit 1
+          REMOTE
+
+      - name: Summary
+        if: steps.gate.outputs.go == 'true'
+        run: echo "Deployed ${GITHUB_SHA::7} to ${VPS_HOST} (${BOT_SERVICE:-fxalexg-bot})." >> "$GITHUB_STEP_SUMMARY"

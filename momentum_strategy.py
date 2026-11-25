@@ -130,7 +130,7 @@ def manage(df, engine, opened_at, current_sl, regime_is_on, now=None):
     if opened.tzinfo is None:
         opened = opened.tz_localize("UTC")
     closed = closed_bars(df, e["tf_hours"], now)
-    lvl = trail_level(closed, opened.floor(f"{e['tf_hours']}h") if e["tf_hours"] < 24 else opened.floor("1D"), engine)
+    lvl = trail_level(closed, opened.floor(pd.Timedelta(hours=e["tf_hours"])), engine)
     if lvl is not None and lvl > (current_sl or 0):
         return "trail", lvl
     return None, None

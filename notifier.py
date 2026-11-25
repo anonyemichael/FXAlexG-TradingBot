@@ -157,6 +157,14 @@ def get_commands():
 
 
 def send(text, keyboard=True, chat_id=None, custom_keyboard=None):
+    # Momentum Breakout messages go to the separate monitor bot when one is configured (monitor_bot.py).
+    # If it can't deliver (no token / no chat yet / Telegram error) the main bot sends it as before.
+    try:
+        import monitor_bot
+        if monitor_bot.enabled() and monitor_bot.is_momentum_message(text) and monitor_bot.send(text):
+            return True
+    except Exception as e:
+        print(f"Monitor routing error: {e}")
     target_chat = chat_id or _load_chat_id()
     if not target_chat:
         print(f"[TELEGRAM - no chat_id] {text}")
