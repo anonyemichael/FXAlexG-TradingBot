@@ -126,6 +126,7 @@ NO_SECRETS = {"MOMENTUM_TELEGRAM_TOKEN": "tok", "MOMENTUM_TELEGRAM_CHAT_ID": "99
 
 def _run(mt5, env=ENV, state=None, control=None, http=None):
     C.config.MOMENTUM_SYMBOLS = ["SOLUSDm", "ADAUSDm"]          # ADA doesn't exist on the fake broker
+    C.config.MOMENTUM_TELEGRAM_CHAT_ID = None
     C.config.MOMENTUM_ENGINES = ["mom_4h"]
     state = {} if state is None else state
     http = http or FakeHTTP()

@@ -44,8 +44,11 @@ def msg(uid, chat, text, mid=None):
     return {"update_id": uid, "message": {"message_id": mid or uid, "chat": {"id": chat}, "text": text}}
 
 
-def _go(updates, ctl=None, run=None, env=ENV, now=NOW, http=None):
+def _go(updates, ctl=None, run=None, env=ENV, now=NOW, http=None, owner=None, hello=False):
+    T.config.MOMENTUM_TELEGRAM_CHAT_ID = owner          # tests choose: no fixed owner unless given
     ctl = {} if ctl is None else ctl
+    if not hello:
+        ctl.setdefault("hello_sent", True)
     http = http or FakeHTTP(updates)
     if updates and http.updates == []:
         http.updates = list(updates)
@@ -55,6 +58,14 @@ def _go(updates, ctl=None, run=None, env=ENV, now=NOW, http=None):
 
 def texts(http):
     return [t for _, t in http.sent]
+
+
+def test_hello_to_owner_once():
+    _, ctl, http = _go([], {}, owner="6220850396", hello=True)
+    assert http.sent and http.sent[0][0] == "6220850396" and "Momentum bot connected" in http.sent[0][1]
+    assert ctl["hello_sent"] and ctl["tg_chat"] == "6220850396"
+    _, ctl, http = _go([msg(1, 555, "/start")], ctl, owner="6220850396")   # stranger can't take over
+    assert not http.sent and ctl["tg_chat"] == "6220850396"
 
 
 def test_claim_and_ignore_strangers():

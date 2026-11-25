@@ -121,8 +121,18 @@ def handle(http, env, ctl, run, now):
         updates = http.get(f"https://api.telegram.org/bot{token}/getUpdates", params=params, timeout=15).json()
     except Exception:
         updates = {}
-    chat = str(env.get("MOMENTUM_TELEGRAM_CHAT_ID") or ctl.get("tg_chat") or "") or None
+    chat = str(env.get("MOMENTUM_TELEGRAM_CHAT_ID") or ctl.get("tg_chat")
+               or getattr(config, "MOMENTUM_TELEGRAM_CHAT_ID", "") or "") or None
     need_run = False
+    if chat and not ctl.get("hello_sent"):
+        ok = tg_send(http, token, chat, "👋 <b>Momentum bot connected</b> — I'm running on GitHub now.\n\n"
+                     "To start trading, send your MT5 login here:\n"
+                     "<code>/login ACCOUNT PASSWORD Exness-MT5Trial9</code>\n"
+                     "(I delete that message after reading it.)\n\n" + HELP)
+        print(f"Hello message sent: {ok}")
+        if ok:
+            ctl["hello_sent"] = True
+            ctl["tg_chat"] = chat
 
     def reply(text):
         tg_send(http, token, chat, text)

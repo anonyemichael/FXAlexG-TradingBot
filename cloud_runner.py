@@ -177,7 +177,8 @@ def run(mt5, env, state, control=None, http=requests, now=None):
     control = control or {}
     live = env.get("MODE", "live") == "live"
     token = env.get("MOMENTUM_TELEGRAM_TOKEN") or ""
-    chat = str(env.get("MOMENTUM_TELEGRAM_CHAT_ID") or control.get("tg_chat") or "") or None
+    chat = str(env.get("MOMENTUM_TELEGRAM_CHAT_ID") or control.get("tg_chat")
+               or getattr(config, "MOMENTUM_TELEGRAM_CHAT_ID", "") or "") or None
     notify = (lambda t: tg_send(http, token, chat, t)) if live else (lambda _t: False)
     plog = []                                                   # private log -> /log in Telegram
     def note(line):

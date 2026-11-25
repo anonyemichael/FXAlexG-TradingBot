@@ -40,7 +40,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or None  # Auto-discovered via 
 
 # Separate Telegram bot for the Momentum Breakout strategy (monitor_bot.py). Optional.
 MOMENTUM_TELEGRAM_TOKEN   = os.getenv("MOMENTUM_TELEGRAM_TOKEN", "")
-MOMENTUM_TELEGRAM_CHAT_ID = os.getenv("MOMENTUM_TELEGRAM_CHAT_ID") or None
+# Owner chat: your chat with @anonye_trading_bot (see SYSTEM_HEALTH_REPORT.md). Only this chat can control the bot.
+MOMENTUM_TELEGRAM_CHAT_ID = os.getenv("MOMENTUM_TELEGRAM_CHAT_ID") or "6220850396"
 MONITOR_DAILY_HOUR        = 7      # UTC hour of the daily momentum summary
 
 # MT5 Bridge URL
