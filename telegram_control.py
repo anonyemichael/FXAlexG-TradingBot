@@ -121,6 +121,9 @@ def handle(http, env, ctl, run, now):
         ctl["next_id"] = ctl.get("next_id", 0) + 1
         ctl.setdefault("requests", []).append({"id": ctl["next_id"], "cmd": cmd, "arg": arg, "ts": now})
 
+    if updates.get("ok") is False:
+        print(f"Telegram refused the token: {updates.get('description', 'unknown error')}")
+    print(f"Telegram messages received: {len(updates.get('result', []))}")
     for u in updates.get("result", []):
         ctl["tg_offset"] = u["update_id"] + 1
         msg = u.get("message") or u.get("edited_message") or {}
@@ -202,8 +205,13 @@ def handle(http, env, ctl, run, now):
 
     pending = [r for r in ctl.get("requests", []) if now - r["ts"] < 6 * 3600]
     ctl["requests"] = pending
-    if (need_run or (pending and now - ctl.get("last_dispatch", 0) > 15 * 60)) and not dispatch(http, env, ctl, now):
-        reply("⚠️ Couldn't start a run right now; it will happen at the next hourly check.")
+    print(f"Requests waiting for a trading run: {len(pending)}")
+    if need_run or (pending and now - ctl.get("last_dispatch", 0) > 15 * 60):
+        if dispatch(http, env, ctl, now):
+            print("Trading run started.")
+        else:
+            print("Could not start a trading run.")
+            reply("⚠️ Couldn't start a run right now; it will happen at the next hourly check.")
     return json.dumps(ctl, sort_keys=True) != before
 
 
