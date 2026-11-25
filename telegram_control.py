@@ -104,6 +104,16 @@ def handle(http, env, ctl, run, now):
     done = set(run.get("done") or [])
     ctl["requests"] = [r for r in ctl.get("requests", []) if r["id"] not in done]
 
+    if not ctl.get("bot_name"):     # once: which bot this token belongs to (public @username only)
+        try:
+            me = http.get(f"https://api.telegram.org/bot{token}/getMe", timeout=15).json()
+            info = http.get(f"https://api.telegram.org/bot{token}/getWebhookInfo", timeout=15).json()
+            if me.get("ok"):
+                ctl["bot_name"] = me["result"].get("username")
+                print(f"Listening as @{ctl['bot_name']}; webhook set: {bool((info.get('result') or {}).get('url'))}; "
+                      f"pending messages: {(info.get('result') or {}).get('pending_update_count')}")
+        except Exception:
+            pass
     params = {"timeout": 0}
     if ctl.get("tg_offset"):
         params["offset"] = ctl["tg_offset"]

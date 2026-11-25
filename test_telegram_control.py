@@ -22,8 +22,12 @@ class FakeHTTP:
         self.dispatch_status = dispatch_status
 
     def get(self, url, params=None, timeout=None):
+        if url.endswith("/getMe"):
+            return NS(json=lambda: {"ok": True, "result": {"username": "my_trading_bot"}})
+        if url.endswith("/getWebhookInfo"):
+            return NS(json=lambda: {"ok": True, "result": {"url": "", "pending_update_count": 0}})
         ups, self.updates = self.updates, []
-        return NS(json=lambda: {"result": ups})
+        return NS(json=lambda: {"ok": True, "result": ups})
 
     def post(self, url, json=None, headers=None, timeout=None):
         if "api.github.com" in url:
@@ -109,7 +113,7 @@ def test_live_commands_queue_and_dispatch_once_a_minute():
 
 
 def test_finished_requests_are_dropped_and_no_change_is_quiet():
-    ctl = {"tg_chat": "777", "requests": [{"id": 1, "cmd": "status", "arg": "", "ts": NOW}], "next_id": 1,
+    ctl = {"tg_chat": "777", "bot_name": "my_trading_bot", "requests": [{"id": 1, "cmd": "status", "arg": "", "ts": NOW}], "next_id": 1,
            "last_dispatch": NOW}
     changed, ctl, http = _go([], ctl, {"done": [1]})
     assert changed and ctl["requests"] == []
