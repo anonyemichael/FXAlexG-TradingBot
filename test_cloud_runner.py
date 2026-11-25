@@ -20,10 +20,10 @@ import cloud_runner as C  # noqa: E402
 NOW = pd.Timestamp("2026-06-10 09:07", tz="UTC")
 
 
-def _bars(n, end, freq, drift, seed, price):
+def _bars(n, end, freq, drift, seed, price, sd=0.01):
     rng = np.random.default_rng(seed)
     idx = pd.date_range(end=end, periods=n, freq=freq, tz="UTC")
-    close = price * np.exp(np.cumsum(rng.normal(drift, 0.01, n)))
+    close = price * np.exp(np.cumsum(rng.normal(drift, sd, n)))
     op = np.r_[price, close[:-1]]
     hi = np.maximum(op, close) * 1.002
     lo = np.minimum(op, close) * 0.998
@@ -31,7 +31,7 @@ def _bars(n, end, freq, drift, seed, price):
 
 
 class FakeMT5:
-    TIMEFRAME_H4, TIMEFRAME_D1 = 16388, 16408
+    TIMEFRAME_H1, TIMEFRAME_H4, TIMEFRAME_D1 = 16385, 16388, 16408
     TRADE_ACTION_DEAL, TRADE_ACTION_SLTP = 1, 6
     ORDER_TYPE_BUY, ORDER_TYPE_SELL = 0, 1
     ORDER_FILLING_FOK, ORDER_FILLING_IOC, ORDER_FILLING_RETURN = 0, 1, 2
@@ -39,7 +39,10 @@ class FakeMT5:
     TRADE_RETCODE_DONE, TRADE_RETCODE_PLACED = 10009, 10008
     DEAL_ENTRY_IN, DEAL_ENTRY_OUT = 0, 1
 
-    def __init__(self, btc_up=True, breakout=True):
+    def __init__(self, btc_up=True, breakout=True, gold=None, balance=10.0):
+        """gold: None (no gold symbol), 'up' (uptrend + 1H breakout), 'down' (downtrend + 1H breakdown),
+        'against' (uptrend but a 1H breakdown), 'quiet' (uptrend, no breakout)."""
+        self.balance = balance
         last4 = NOW.floor("4h") - pd.Timedelta(hours=4)          # last closed 4H candle (open time)
         self.h4 = {"SOLUSDm": _bars(300, last4 + pd.Timedelta(hours=4), "4h", 0.0, 1, 150.0)}
         if breakout:   # make the last CLOSED candle break the 42-candle high
@@ -52,6 +55,21 @@ class FakeMT5:
                    "SOLUSDm": _bars(300, d_end, "1D", 0.0, 3, 150.0)}
         self.positions, self.deals, self.orders, self.mods, self.closes = [], [], [], [], []
         self.logged_in = False
+        self.h1 = {}
+        self.gold = gold
+        if gold:
+            last1 = NOW.floor("1h") - pd.Timedelta(hours=1)          # last closed 1H candle
+            g = _bars(400, last1 + pd.Timedelta(hours=1), "1h", 0.0, 4, 3500.0, sd=0.002)
+            i = g.index.get_loc(last1)
+            if gold in ("up", "down", "against"):
+                if gold == "up":
+                    g.iloc[i, g.columns.get_loc("close")] = g["high"].iloc[i - 120:i].max() * 1.003
+                    g.iloc[i, g.columns.get_loc("high")] = g["close"].iloc[i] * 1.0005
+                else:
+                    g.iloc[i, g.columns.get_loc("close")] = g["low"].iloc[i - 120:i].min() * 0.997
+                    g.iloc[i, g.columns.get_loc("low")] = g["close"].iloc[i] * 0.9995
+            self.h1["XAUUSDm"] = g
+            self.d1["XAUUSDm"] = _bars(300, d_end, "1D", -0.003 if gold == "down" else 0.003, 5, 3000.0)
 
     # connection
     def initialize(self, **kw):
@@ -61,10 +79,14 @@ class FakeMT5:
     def last_error(self): return (-6, "Authorization failed")
     def shutdown(self): pass
     def terminal_info(self): return NS(trade_allowed=True, connected=True)
-    def account_info(self): return NS(balance=10.0, equity=10.0, login=123)
+    def account_info(self): return NS(balance=self.balance, equity=self.balance, login=123)
 
     # symbols
     def symbol_info(self, s):
+        if s == "XAUUSDm" and self.gold:            # Exness Standard: 1 lot = 100 oz, 0.01 lot minimum
+            return NS(digits=2, point=0.01, spread=30, trade_tick_size=0.01, trade_tick_value=1.0, trade_mode=4,
+                      volume_min=0.01, volume_max=200.0, volume_step=0.01, filling_mode=1, trade_stops_level=0,
+                      trade_contract_size=100.0)
         if s not in ("SOLUSDm", "BTCUSDm"):
             return None
         return NS(digits=3, point=0.001, spread=50, trade_tick_size=0.001, trade_tick_value=0.001,
@@ -73,11 +95,12 @@ class FakeMT5:
     def symbol_select(self, s, on): return True
 
     def symbol_info_tick(self, s):
-        px = float((self.h4.get(s) if s in self.h4 else self.d1[s])["close"].iloc[-1])
+        src = self.h1 if s in self.h1 else self.h4 if s in self.h4 else self.d1
+        px = float(src[s]["close"].iloc[-1])
         return NS(time=int(NOW.timestamp()), bid=px, ask=px * 1.0005)
 
     def copy_rates_from_pos(self, s, tf, start, n):
-        df = (self.h4 if tf == self.TIMEFRAME_H4 else self.d1).get(s)
+        df = {self.TIMEFRAME_H1: self.h1, self.TIMEFRAME_H4: self.h4}.get(tf, self.d1).get(s)
         if df is None:
             return None
         out = df.iloc[-n:].copy()
@@ -91,16 +114,18 @@ class FakeMT5:
         return [d for d in self.deals if frm.timestamp() <= d.time <= to.timestamp()]
 
     def order_send(self, req):
-        if req["action"] == self.TRADE_ACTION_DEAL and req["type"] == self.ORDER_TYPE_BUY:
+        if req["action"] == self.TRADE_ACTION_DEAL and "position" not in req:      # open (buy or sell)
             self.orders.append(req)
             t = int(NOW.timestamp())
             self.positions.append(NS(ticket=len(self.orders), symbol=req["symbol"], volume=req["volume"], sl=req["sl"],
-                                     tp=0.0, magic=req["magic"], comment=req["comment"], time=t, profit=0.0))
+                                     tp=0.0, magic=req["magic"], comment=req["comment"], time=t, profit=0.0,
+                                     type=req["type"], price_open=req["price"]))
             self.deals.append(NS(symbol=req["symbol"], entry=self.DEAL_ENTRY_IN, magic=req["magic"], time=t, profit=0.0))
         elif req["action"] == self.TRADE_ACTION_SLTP:
             self.mods.append(req)
         else:
             self.closes.append(req)
+            self.positions = [p for p in self.positions if p.ticket != req.get("position")]
         return NS(retcode=self.TRADE_RETCODE_DONE, comment="done")
 
 
@@ -291,6 +316,64 @@ def test_breakout_on_blocked_coin_is_not_bought():
     mt5 = FxMT5()
     _, state, _, _ = _run(mt5)
     assert not mt5.orders and any("disabled on this account" in l for l in state["log"])
+
+
+def test_gold_buys_breakout_in_uptrend():
+    mt5 = FakeMT5(breakout=False, gold="up", balance=5000.0)
+    _, state, http, out = _run(mt5)
+    o = [x for x in mt5.orders if x["symbol"] == "XAUUSDm"]
+    assert len(o) == 1 and o[0]["type"] == mt5.ORDER_TYPE_BUY and o[0]["magic"] == C.MAGIC_METAL
+    assert o[0]["sl"] < o[0]["price"] and o[0]["volume"] >= 0.01
+    msg = next(t for t in http.sent if "BUY XAUUSDm" in t)
+    assert "Gold 1H breakout" in msg and "Why:" in msg and "200-day" in msg and "trails up" in msg
+    assert "XAU" not in out and "3,5" not in out                      # public log stays generic
+    assert state["health"]["gold"]["trend"] == 1
+
+
+def test_gold_sells_breakdown_in_downtrend_and_trails_down():
+    mt5 = FakeMT5(breakout=False, gold="down", balance=5000.0)
+    _, state, http, _ = _run(mt5)
+    o = [x for x in mt5.orders if x["symbol"] == "XAUUSDm"]
+    assert len(o) == 1 and o[0]["type"] == mt5.ORDER_TYPE_SELL and o[0]["sl"] > o[0]["price"]
+    assert any("SELL XAUUSDm" in t and "breakdown" in t and "trails down" in t for t in http.sent)
+    # next run: the stop of the open SELL is only ever lowered; /close XAUUSD buys it back at the ask
+    pos = mt5.positions[0]
+    pos.sl = o[0]["price"] * 1.05                                     # loose stop -> must be tightened
+    pos.time = int((NOW - pd.Timedelta(hours=5)).timestamp())
+    control = {"requests": [{"id": 3, "cmd": "close", "arg": "xauusd", "ts": 0}]}
+    _, _, http, _ = _run(mt5, state={"last_run": NOW.timestamp()}, control=control)
+    assert mt5.closes and mt5.closes[0]["type"] == mt5.ORDER_TYPE_BUY and mt5.closes[0]["position"] == pos.ticket
+    assert any("Closed XAUUSDm" in t for t in http.sent)
+
+
+def test_gold_trailing_stop_for_open_sell():
+    mt5 = FakeMT5(breakout=False, gold="quiet", balance=5000.0)
+    px = float(mt5.h1["XAUUSDm"]["close"].iloc[-1])
+    mt5.positions.append(NS(ticket=77, symbol="XAUUSDm", volume=0.02, sl=px * 1.05, tp=0.0, magic=C.MAGIC_METAL,
+                            comment="MET 1H", time=int((NOW - pd.Timedelta(hours=10)).timestamp()), profit=1.0,
+                            type=1, price_open=px * 1.01))
+    _, _, http, _ = _run(mt5)
+    assert mt5.mods and mt5.mods[0]["sl"] < px * 1.05 and mt5.mods[0]["sl"] > px
+    assert any("SELL: stop lowered" in t for t in http.sent)
+
+
+def test_gold_trend_filter_blocks_the_wrong_side():
+    mt5 = FakeMT5(breakout=False, gold="against", balance=5000.0)
+    _, _, _, _ = _run(mt5)
+    assert not [x for x in mt5.orders if x["symbol"] == "XAUUSDm"]
+
+
+def test_gold_skipped_once_when_account_too_small():
+    mt5 = FakeMT5(breakout=False, gold="up", balance=50.0)
+    _, state, http, _ = _run(mt5)
+    assert not mt5.orders and any("Gold BUY signal skipped" in t and "Cent" in t for t in http.sent)
+    _, _, http, _ = _run(mt5, state=state)
+    assert not any("signal skipped" in t for t in http.sent)               # not repeated every hour
+    mt5 = FakeMT5(breakout=False, gold="up", balance=1000.0)              # min lot ~5.6% > 5% cap -> skipped
+    _run(mt5)
+    assert not mt5.orders
+    _run(mt5, control={"gold_risk": 8})                                   # /goldrisk 8 raises the cap -> taken
+    assert [o["volume"] for o in mt5.orders if o["symbol"] == "XAUUSDm"] == [0.01]
 
 
 def test_hourly_note_and_quiet():

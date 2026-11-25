@@ -1,5 +1,5 @@
-# Momentum Breakout bot running on GitHub itself (no VPS): once an hour a Windows machine installs MT5,
-# logs in, runs cloud_runner.py (manage trades, new breakouts, Telegram) and shuts down.
+# Momentum bot running on GitHub itself (no VPS): once an hour a Windows machine installs MT5, logs in, runs
+# cloud_runner.py (crypto breakouts + gold 1H breakouts both ways: manage trades, new entries, Telegram), shuts down.
 #
 # Telegram control: telegram-control.yml answers your commands, starts this workflow on demand and, because
 # GitHub's cron is unreliable, also starts the hourly check itself (hourly=true). The cron below is a backup.
@@ -31,7 +31,7 @@ on:
         default: false
   push:
     branches: [main, ccr-40ef48ac-4webyc]
-    paths: ["cloud_runner.py", "cloud_common.py", "momentum_strategy.py", "config.py", ".github/workflows/cloud-bot.yml"]
+    paths: ["cloud_runner.py", "cloud_common.py", "momentum_strategy.py", "metals_strategy.py", "config.py", ".github/workflows/cloud-bot.yml"]
 
 permissions:
   contents: read

@@ -155,6 +155,22 @@ def test_quiet_verbose_and_testtrade():
     assert ctl["verbose"] is True and ctl["requests"][-1]["cmd"] == "testtrade" and http.dispatches
 
 
+def test_gold_and_goldrisk():
+    run = {"last_run": NOW - 300, "health": {"balance": "$224.47", "gold": {
+        "symbol": "XAUUSDm", "trend": -1, "close": 3480.5, "ema": 3550.0, "hi": 3601.0, "lo": 3455.2,
+        "stop": 16.4, "min_risk": 16.4}}}
+    _, ctl, http = _go([msg(1, 777, "/gold"), msg(2, 777, "/goldrisk 3"), msg(3, 777, "/goldrisk 9"),
+                        msg(4, 777, "/settings")], {"tg_chat": "777"}, run)
+    gold, ok, bad, settings = texts(http)
+    assert "DOWN" in gold and "sells only" in gold and "SELL if a 1H candle closes below 3,455.20" in gold
+    assert "7.3% of balance" in gold and "5 min ago" in gold
+    assert ctl["gold_risk"] == 3.0 and "3%" in ok and "0.5 to 8" in bad and "Gold 1H (buy + sell): risk <b>3%" in settings
+    _, ctl, http = _go([msg(6, 777, "/goldrisk 8")], ctl, run)
+    assert ctl["gold_risk"] == 8.0 and "drawdowns" in texts(http)[0]
+    _, _, http = _go([msg(5, 777, "/gold")], {"tg_chat": "777"}, {})
+    assert "not checked yet" in texts(http)[0]
+
+
 def test_main_saves_before_dispatch():
     import tempfile
     from cloud_common import load_json

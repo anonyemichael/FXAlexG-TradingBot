@@ -26,11 +26,13 @@ import pandas as pd
 import requests
 
 import config
+import metals_strategy as MS
 import momentum_strategy as M
-from cloud_common import CONTROL_STATE, DEFAULT_SERVER, RUNNER_STATE, load_json, save_json, tg_send
+from cloud_common import CONTROL_STATE, DEFAULT_SERVER, RUNNER_STATE, gold_text, load_json, save_json, tg_send
 
 MAGIC = 26112501
 MAGIC_TEST = MAGIC + 1        # /testtrade positions (opened and closed in the same run)
+MAGIC_METAL = MAGIC + 2       # gold 1H breakout trades (buys and sells)
 COMMENT = {"mom_4h": "MOM 4H", "mom_d1": "MOM D1"}
 
 
@@ -85,10 +87,11 @@ class Broker:
             self.offset = off if abs(off) <= 14 else 0      # a stale tick (weekend/holiday) can't be an offset
 
     def resolve(self, name):
-        """Exness standard accounts use an 'm' suffix (SOLUSDm); try with and without it."""
+        """Exness Standard accounts use an 'm' suffix (SOLUSDm), Standard Cent a 'c' suffix (XAUUSDc)."""
         if name in self.names:
             return self.names[name]
-        for cand in (name, name[:-1] if name.endswith("m") else name + "m"):
+        base = name[:-1] if name[-1:] in ("m", "c") else name
+        for cand in dict.fromkeys((name, base, base + "m", base + "c")):
             if self.mt5.symbol_info(cand) is not None:
                 self.mt5.symbol_select(cand, True)
                 self.names[name] = cand
@@ -97,7 +100,7 @@ class Broker:
         return None
 
     def bars(self, symbol, engine, n=300):
-        tf = self.mt5.TIMEFRAME_H4 if engine == "mom_4h" else self.mt5.TIMEFRAME_D1
+        tf = {"mom_4h": self.mt5.TIMEFRAME_H4, "met_1h": self.mt5.TIMEFRAME_H1}.get(engine, self.mt5.TIMEFRAME_D1)
         rates = self.mt5.copy_rates_from_pos(symbol, tf, 0, n)
         if rates is None or len(rates) == 0:
             return None
@@ -108,13 +111,16 @@ class Broker:
     def utc(self, server_ts):
         return pd.Timestamp(server_ts - self.offset * 3600, unit="s", tz="UTC")
 
-    def positions(self):
-        return [p for p in (self.mt5.positions_get() or []) if p.magic == MAGIC]
+    def positions(self, magic=MAGIC):
+        return [p for p in (self.mt5.positions_get() or []) if p.magic == magic]
 
-    def deals(self, since_utc):
+    def all_positions(self):
+        return self.positions(MAGIC) + self.positions(MAGIC_METAL)
+
+    def deals(self, since_utc, magics=(MAGIC, MAGIC_METAL)):
         frm = datetime.fromtimestamp(since_utc.timestamp() + self.offset * 3600, tz=timezone.utc)
         to = datetime.now(timezone.utc) + timedelta(days=3650)      # "until now", whatever the clocks say
-        return [d for d in (self.mt5.history_deals_get(frm, to) or []) if d.magic == MAGIC]
+        return [d for d in (self.mt5.history_deals_get(frm, to) or []) if d.magic in magics]
 
     def _filling(self, info):
         fm = getattr(info, "filling_mode", 0) or 0
@@ -130,24 +136,37 @@ class Broker:
         return ok, (res.retcode if res is not None else None), (getattr(res, "comment", "") if res is not None else
                                                                  str(self.mt5.last_error()))
 
-    def buy(self, symbol, lot, sl, comment, magic=MAGIC):
+    def order(self, symbol, direction, lot, sl, comment, magic=MAGIC):
+        """direction +1 = buy at the ask, -1 = sell at the bid."""
         info, tick = self.mt5.symbol_info(symbol), self.mt5.symbol_info_tick(symbol)
         return self._send({"action": self.mt5.TRADE_ACTION_DEAL, "symbol": symbol, "volume": lot,
-                           "type": self.mt5.ORDER_TYPE_BUY, "price": tick.ask, "sl": round(sl, info.digits),
+                           "type": self.mt5.ORDER_TYPE_BUY if direction > 0 else self.mt5.ORDER_TYPE_SELL,
+                           "price": tick.ask if direction > 0 else tick.bid, "sl": round(sl, info.digits),
                            "tp": 0.0, "deviation": 50, "magic": magic, "comment": comment,
                            "type_time": self.mt5.ORDER_TIME_GTC, "type_filling": self._filling(info)})
+
+    def buy(self, symbol, lot, sl, comment, magic=MAGIC):
+        return self.order(symbol, 1, lot, sl, comment, magic)
 
     def modify_sl(self, pos, sl):
         info = self.mt5.symbol_info(pos.symbol)
         return self._send({"action": self.mt5.TRADE_ACTION_SLTP, "symbol": pos.symbol, "position": pos.ticket,
-                           "sl": round(sl, info.digits), "tp": pos.tp, "magic": MAGIC})
+                           "sl": round(sl, info.digits), "tp": pos.tp, "magic": getattr(pos, "magic", MAGIC)})
 
     def close(self, pos):
+        """Close at market: a buy is closed by selling at the bid, a sell by buying at the ask."""
         info, tick = self.mt5.symbol_info(pos.symbol), self.mt5.symbol_info_tick(pos.symbol)
+        short = side_of(pos) < 0
         return self._send({"action": self.mt5.TRADE_ACTION_DEAL, "symbol": pos.symbol, "volume": pos.volume,
-                           "type": self.mt5.ORDER_TYPE_SELL, "position": pos.ticket, "price": tick.bid,
+                           "type": self.mt5.ORDER_TYPE_BUY if short else self.mt5.ORDER_TYPE_SELL,
+                           "position": pos.ticket, "price": tick.ask if short else tick.bid,
                            "deviation": 50, "magic": getattr(pos, "magic", MAGIC), "comment": "MOM exit",
                            "type_time": self.mt5.ORDER_TIME_GTC, "type_filling": self._filling(info)})
+
+
+def side_of(pos):
+    """+1 for a buy position, -1 for a sell (MT5 POSITION_TYPE_SELL = 1)."""
+    return -1 if getattr(pos, "type", 0) == 1 else 1
 
 
 def size_trade(info, sl_dist, balance, risk_pct, cap_pct):
@@ -197,6 +216,10 @@ MODE_NAMES = {0: "disabled", 1: "long only", 2: "short only", 3: "close only", 4
 
 def can_buy(info):
     return getattr(info, "trade_mode", 4) in BUY_MODES
+
+
+def can_trade(info, direction):
+    return getattr(info, "trade_mode", 4) in (BUY_MODES if direction > 0 else (2, 4))
 
 
 def permissions(mt5):
@@ -397,17 +420,17 @@ def run(mt5, env, state, control=None, http=requests, now=None):
     # 1. queued Telegram requests that change positions
     for r in requests_:
         if r["cmd"] == "close":
-            want = r["arg"].upper().rstrip("M")
-            hits = [p for p in br.positions() if p.symbol.upper().rstrip("M") == want]
+            want = r["arg"].upper().rstrip("MC")
+            hits = [p for p in br.all_positions() if p.symbol.upper().rstrip("MC") == want]
             if not hits:
-                notify(f"🛰️ No open momentum trade on {r['arg']}.")
+                notify(f"🛰️ No open bot trade on {r['arg']}.")
             for p in hits:
                 ok_, code, msg = close_pos(p, "you asked")
                 notify(f"{'✅ Closed' if ok_ else '❌ Could not close'} {p.symbol}" + ("" if ok_ else f" ({code} {msg})"))
         elif r["cmd"] == "closeall":
-            ps = br.positions()
+            ps = br.all_positions()
             res = [close_pos(p, "close all")[0] for p in ps]
-            notify(f"✅ Closed {sum(res)} of {len(ps)} momentum trades." if ps else "🛰️ No open momentum trades.")
+            notify(f"✅ Closed {sum(res)} of {len(ps)} bot trades." if ps else "🛰️ No open bot trades.")
         elif r["cmd"] == "testtrade" and live:
             notify(test_trade(mt5, br, syms, note))
 
@@ -431,6 +454,27 @@ def run(mt5, env, state, control=None, http=requests, now=None):
                         events.append(f"🛰️ {pos.symbol}: stop raised to {new_sl:.6g}")
         else:
             note(f"{pos.symbol}: holding, stop {pos.sl:.6g}, P&L ${pos.profit:+.2f}")
+
+    # 2b. gold trades (buys and sells): trail the stop after every 1H close
+    gold_on = getattr(config, "METALS_ENABLED", True)
+    gsyms = {s: br.resolve(s) for s in (MS.SYMBOLS if gold_on else [])}
+    for pos in br.positions(MAGIC_METAL):
+        d = side_of(pos)
+        new_sl = MS.manage(br.bars(pos.symbol, "met_1h", 400), d, br.utc(pos.time), pos.sl,
+                           getattr(pos, "price_open", None), now)
+        tick, info = mt5.symbol_info_tick(pos.symbol), mt5.symbol_info(pos.symbol)
+        min_gap = (getattr(info, "trade_stops_level", 0) or 0) * info.point
+        valid = new_sl is not None and (new_sl < tick.bid - min_gap if d > 0 else new_sl > tick.ask + min_gap) \
+            and abs(new_sl - (pos.sl or 0)) > info.point
+        if valid and live:
+            ok_, code, msg = br.modify_sl(pos, new_sl)
+            note(f"{pos.symbol} {'BUY' if d > 0 else 'SELL'}: stop {pos.sl:.6g} -> {new_sl:.6g} "
+                 f"{'ok' if ok_ else f'FAILED {code} {msg}'}")
+            if ok_:
+                events.append(f"🥇 {pos.symbol} {'BUY' if d > 0 else 'SELL'}: stop "
+                              f"{'raised' if d > 0 else 'lowered'} to {new_sl:.6g}")
+        else:
+            note(f"{pos.symbol} {'BUY' if d > 0 else 'SELL'}: holding, stop {pos.sl:.6g}, P&L ${pos.profit:+.2f}")
 
     # 3. trades closed since the last run
     since = pd.Timestamp(state["last_run"], unit="s", tz="UTC") if state.get("last_run") else now - pd.Timedelta(hours=2)
@@ -495,8 +539,86 @@ def run(mt5, env, state, control=None, http=requests, now=None):
                                   f"Why: {setup['met'][1]}; {setup['met'][0]}")
                 else:
                     events.append(f"❌ {sym} order rejected ({code} {msg})")
-    log(f"Checked {sum(1 for s in syms.values() if s)} symbols; {entries} new entr{'y' if entries == 1 else 'ies'}.")
-    health["open"] = len(br.positions())
+
+    # 4b. gold 1H breakout — buys above its 200-day EMA, sells below (independent of the BTC filter)
+    gold_note = "off"
+    grisk = float(control.get("gold_risk") or env.get("METALS_RISK_PCT") or getattr(config, "METALS_RISK_PCT", 2.0))
+    gcap = max(getattr(config, "METALS_MAX_RISK_PCT", 5.0), grisk)    # /goldrisk above 5 also raises the cap
+    for name, sym in gsyms.items():
+        if not sym:
+            note(f"{name}: not on this account")
+            gold_note = "not on this account"
+            continue
+        h1, d1 = br.bars(sym, "met_1h", 400), br.bars(sym, "mom_d1", 300)
+        info, tick = mt5.symbol_info(sym), mt5.symbol_info_tick(sym)
+        bars = MS.closed_bars(h1, 1, now)
+        tr, dclose, ema = MS.trend(MS.closed_bars(d1, 24, now))
+        g = {"symbol": sym, "trend": tr, "close": dclose, "ema": ema}
+        if bars is not None and len(bars) > MS.BREAK + MS.ATR_LEN:
+            a = float(MS.atr(bars).iloc[-1])
+            g.update(hi=float(bars["high"].iloc[-MS.BREAK:].max()), lo=float(bars["low"].iloc[-MS.BREAK:].min()),
+                     stop=MS.STOP_ATR * a)
+            if info is not None and info.trade_tick_size:
+                g["min_risk"] = info.volume_min * MS.STOP_ATR * a / info.trade_tick_size * info.trade_tick_value
+        health["gold"] = g
+        if control.get("paused"):
+            gold_note = "paused"
+            continue
+        if any(p.symbol == sym for p in br.positions(MAGIC_METAL)):
+            gold_note = "trade open"
+            continue
+        setup = MS.entry_signal(sym, h1, d1, now)
+        if not setup:
+            gold_note = "no breakout"
+            if tr and g.get("hi"):
+                note(f"{sym} {MS.LABEL}: no breakout ({'buy above ' + format(g['hi'], ',.2f') if tr > 0 else 'sell below ' + format(g['lo'], ',.2f')})")
+            else:
+                note(f"{sym} {MS.LABEL}: no signal")
+            continue
+        d = setup["dir"]
+        side = "BUY" if d > 0 else "SELL"
+        sig_close = pd.Timestamp(setup["signal_time"]) + pd.Timedelta(hours=1)
+        if sig_close.tzinfo is None:
+            sig_close = sig_close.tz_localize("UTC")
+        if any(x.symbol == sym and x.entry == mt5.DEAL_ENTRY_IN for x in br.deals(sig_close, (MAGIC_METAL,))):
+            note(f"{sym} {MS.LABEL}: breakout already traded")
+            gold_note = "breakout already traded"
+            continue
+        if not can_trade(info, d):
+            note(f"{sym} {MS.LABEL}: {side} signal, but {side.lower()}ing is not allowed on this account")
+            continue
+        if info.spread * info.point > getattr(config, "METALS_MAX_SPREAD_FRAC", 0.15) * setup["sl_dist"]:
+            note(f"{sym} {MS.LABEL}: {side} skipped, spread too wide")
+            continue
+        lot, risk_usd, why = size_trade(info, setup["sl_dist"], balance, grisk, gcap)
+        if lot is None:
+            note(f"{sym} {MS.LABEL}: {side} skipped, {why}")
+            gold_note = "signal skipped (account too small)"
+            if state.get("gold_skip") != setup["signal_time"]:
+                state["gold_skip"] = setup["signal_time"]
+                events.append(f"🥇 Gold {side} signal skipped: {why}.\nA Standard Cent account (or a bigger "
+                              f"balance) lets the bot size gold trades properly. /gold for details.")
+            continue
+        price = tick.ask if d > 0 else tick.bid
+        sl = price - d * setup["sl_dist"]
+        if not live:
+            entries += 1
+            continue
+        ok_, code, msg = br.order(sym, d, lot, sl, MS.COMMENT, MAGIC_METAL)
+        note(f"{side} {sym} {lot} lot, stop {sl:.6g}, risk ${risk_usd:.2f}: {'ok' if ok_ else f'REJECTED {code} {msg}'}")
+        if ok_:
+            entries += 1
+            gold_note = f"{side.lower()} opened"
+            events.append(f"{'🟢' if d > 0 else '🔴'} <b>{side} {sym}</b> ({MS.LABEL} {'breakout' if d > 0 else 'breakdown'})\n"
+                          f"Entry ~{price:,.2f} · Stop {sl:,.2f} ({setup['sl_dist']:,.2f} away, trails "
+                          f"{'up' if d > 0 else 'down'}) · Lots {lot}\n"
+                          f"Risk ${risk_usd:.2f} ({risk_usd / balance * 100:.1f}% of ${balance:.2f})\n"
+                          f"Why: {setup['met'][1]}; {setup['met'][0]}")
+        else:
+            events.append(f"❌ {sym} {side} order rejected ({code} {msg})")
+    log(f"Checked {sum(1 for s in syms.values() if s) + sum(1 for s in gsyms.values() if s)} symbols; "
+        f"{entries} new entr{'y' if entries == 1 else 'ies'}.")
+    health["open"] = len(br.all_positions())
 
     # 5. Telegram replies, events, daily summary
     def status():
@@ -504,28 +626,33 @@ def run(mt5, env, state, control=None, http=requests, now=None):
         a = mt5.account_info()
         if a:
             lines.append(f"Balance <b>${a.balance:.2f}</b> · Equity <b>${a.equity:.2f}</b>")
-        lines.append(f"New trades: {'PAUSED ⏸️' if control.get('paused') else 'on'} · Risk {risk:g}%/trade")
-        ps = br.positions()
+        lines.append(f"New trades: {'PAUSED ⏸️' if control.get('paused') else 'on'} · Risk {risk:g}%/trade crypto, "
+                     f"{grisk:g}% gold")
+        ps = br.all_positions()
         lines.append(f"\n<b>Open trades: {len(ps)}</b>")
         for p in ps:
-            lines.append(f"• {p.symbol} ({'Daily' if engine_of(p) == 'mom_d1' else '4H'}) "
+            kind = MS.LABEL if p.magic == MAGIC_METAL else ("Daily" if engine_of(p) == "mom_d1" else "4H")
+            lines.append(f"• {'SELL' if side_of(p) < 0 else 'BUY'} {p.symbol} ({kind}) "
                          f"{p.volume} lot, stop {p.sl:.6g}, P&L ${p.profit:+.2f}")
         closed = [d for d in br.deals(now - pd.Timedelta(days=7)) if d.entry == mt5.DEAL_ENTRY_OUT]
         lines.append(f"\nLast 7 days: {len(closed)} closed, <b>${sum(d.profit for d in closed):+.2f}</b>")
         lines.append("\n" + filter_text(btc_d, now))
+        if health.get("gold"):
+            lines.append("\n" + gold_text(health["gold"], balance))
         return "\n".join(lines)
 
     def trades():
         ds = [d for d in br.deals(now - pd.Timedelta(days=90)) if d.entry == mt5.DEAL_ENTRY_OUT][-10:]
         if not ds:
-            return "🛰️ No closed momentum trades yet."
-        return "🛰️ <b>Last momentum trades</b>\n" + "\n".join(
+            return "🛰️ No closed bot trades yet."
+        return "🛰️ <b>Last bot trades</b>\n" + "\n".join(
             f"• {br.utc(d.time):%d %b} {d.symbol}: <b>${d.profit:+.2f}</b>" for d in ds)
 
     if live:
         for r in requests_:
             if r["cmd"] == "status":
-                notify(status())
+                if notify(status()) and now.hour >= getattr(config, "MONITOR_DAILY_HOUR", 7):
+                    state["summary_day"] = now.strftime("%Y-%m-%d")      # counts as today's summary
             elif r["cmd"] == "trades":
                 notify(trades())
             elif r["cmd"] == "run":
@@ -541,7 +668,7 @@ def run(mt5, env, state, control=None, http=requests, now=None):
         elif (env.get("GITHUB_EVENT_NAME") == "schedule" or env.get("HOURLY_CHECK") == "true") \
                 and control.get("verbose", True):
             why = ("paused by you" if control.get("paused") else
-                   "no breakouts" if on else "BTC filter off, waiting")
+                   ("crypto: no breakouts" if on else "crypto: BTC filter off") + f"; gold: {gold_note}")
             notify(f"🕐 {now:%H:%M} UTC check — {health['open']} open trade(s), no new trades ({why}). "
                    f"Balance ${balance:.2f}. /quiet to stop these notes.")
         today = now.strftime("%Y-%m-%d")

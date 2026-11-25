@@ -99,6 +99,18 @@ MOMENTUM_RISK_PCT      = 5.0    # used when no accounts.db rows exist (per-accou
 MOMENTUM_MAX_RISK_PCT  = 8.0    # skip a trade if even the minimum lot would risk more than this
 MOMENTUM_MAX_SPREAD_FRAC = 0.15 # skip if the live spread is more than 15% of the stop distance
 
+# ── Gold 1H Breakout, both directions (metals_strategy.py, research: GOLD_FOREX_RESEARCH.md) ──
+# Buys above / sells below gold's 200-day EMA when a 1H candle breaks the last 120 candles' high / low;
+# stop 2 x ATR(20) on 1H, trailed every hour. Forex pairs were tested too and did not pass.
+METALS_ENABLED       = os.getenv("METALS_ENABLED", "1") == "1"
+METALS_SYMBOLS       = ["XAUUSDm"]
+METALS_BREAKOUT      = 120
+METALS_STOP_ATR      = 2.0
+METALS_TREND_EMA     = 200
+METALS_RISK_PCT      = 2.0    # /goldrisk in Telegram (0.5-8); a /goldrisk above the cap also raises the cap
+METALS_MAX_RISK_PCT  = 5.0    # skip if even the minimum lot would risk more (Standard accounts: 0.01 lot = 1 oz)
+METALS_MAX_SPREAD_FRAC = 0.15
+
 # --- 4H crypto swing (swing_strategy.py) — account method "swing4h" ---
 # Buy when a 4H candle closes above the previous 42 candles' high (a break of last week's high), stop 2xATR(20),
 # trailed every 4H, no fixed target. Backtest Mar 2024 - Oct 2026 (swing_research.py): 7 coins below + LTC,

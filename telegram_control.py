@@ -16,7 +16,7 @@ import time
 import requests
 
 import config
-from cloud_common import CONTROL_STATE, DEFAULT_SERVER, HELP, RUNNER_STATE, load_json, save_json, tg_send
+from cloud_common import CONTROL_STATE, DEFAULT_SERVER, HELP, RUNNER_STATE, gold_text, load_json, save_json, tg_send
 
 LIVE_CMDS = {"/status": "status", "/trades": "trades", "/run": "run", "/testtrade": "testtrade"}
 
@@ -34,11 +34,13 @@ def settings_text(ctl):
     login = ctl.get("creds") or {}
     return ("⚙️ <b>Settings</b>\n"
             f"New trades: <b>{'PAUSED ⏸️' if ctl.get('paused') else 'ON ▶️'}</b>\n"
-            f"Risk per trade: <b>{risk:g}%</b> (never above {getattr(config, 'MOMENTUM_MAX_RISK_PCT', 8.0):g}%)\n"
+            f"Crypto risk per trade: <b>{risk:g}%</b> (never above {getattr(config, 'MOMENTUM_MAX_RISK_PCT', 8.0):g}%)\n"
             f"Max open trades: {getattr(config, 'MOMENTUM_MAX_OPEN', 4)}\n"
             f"Hourly check notes: {'on' if ctl.get('verbose', True) else 'off'}\n"
             f"Coins: {coins}\n"
             f"Engines: 4H + Daily breakouts, BTC EMA{getattr(config, 'MOMENTUM_REGIME_EMA', 100)} filter\n"
+            f"Gold 1H (buy + sell): risk <b>{ctl.get('gold_risk') or getattr(config, 'METALS_RISK_PCT', 2.0):g}%</b> "
+            f"(never above {getattr(config, 'METALS_MAX_RISK_PCT', 5.0):g}%)\n"
             f"MT5 login: {('account ' + str(login.get('login')) + ' on ' + str(login.get('server'))) if login else 'GitHub secrets or not set'}")
 
 
@@ -204,7 +206,7 @@ def handle(http, env, ctl, run, now, updates=None, dispatcher=None):
             reply("⏸️ Paused: no new trades. Open trades keep their stops and are still managed. /resume to restart.")
         elif cmd == "/resume":
             ctl["paused"] = False
-            reply("▶️ Resumed: new breakouts will be traded (while the BTC filter is on).")
+            reply("▶️ Resumed: new breakouts will be traded (crypto while the BTC filter is on; gold both ways).")
         elif cmd == "/risk":
             try:
                 v = float(parts[1].rstrip("%"))
@@ -214,6 +216,27 @@ def handle(http, env, ctl, run, now, updates=None, dispatcher=None):
                 reply(f"✅ Risk per trade set to <b>{v:g}%</b> from the next trade.")
             except (IndexError, ValueError):
                 reply("Send a number from 0.5 to 10, e.g. <code>/risk 3</code>")
+        elif cmd == "/goldrisk":
+            try:
+                v = float(parts[1].rstrip("%"))
+                if not 0.5 <= v <= 8:
+                    raise ValueError
+                ctl["gold_risk"] = v
+                reply(f"✅ Gold risk per trade set to <b>{v:g}%</b> from the next gold trade."
+                      + ("\n⚠️ Above 3% the backtest's worst drawdowns were 40–80%. 2% is the tested default."
+                         if v > 3 else ""))
+            except (IndexError, ValueError):
+                reply("Send a number from 0.5 to 8, e.g. <code>/goldrisk 2</code>")
+        elif cmd == "/gold":
+            g = (run.get("health") or {}).get("gold")
+            if not g:
+                reply("🥇 Gold not checked yet — it is read on the next trading run. Send /run.")
+            else:
+                try:
+                    bal = float(str((run.get("health") or {}).get("balance", "")).lstrip("$"))
+                except ValueError:
+                    bal = None
+                reply(gold_text(g, bal) + f"\nChecked {_ago(run.get('last_run'), now)}.")
         elif cmd in ("/quiet", "/verbose"):
             ctl["verbose"] = cmd == "/verbose"
             reply("🔕 Hourly check notes off (trades, errors and the daily summary still come)." if cmd == "/quiet"

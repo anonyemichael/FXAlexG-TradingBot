@@ -24,15 +24,22 @@ GitHub's cache, encrypted with your bot token, so nothing readable is stored in 
 | `/log` | what the last trading run did, line by line | seconds to ~1 min |
 | `/health` | last run, MT5 login, Algo Trading, last error | seconds to ~1 min |
 | `/filter` | Bitcoin trend filter (on = trading allowed) | seconds to ~1 min |
+| `/gold` | gold trend (buys or sells only), next buy/sell level, whether your balance can size it | seconds to ~1 min |
+| `/goldrisk 2` | gold risk per trade in % (0.5–8, tested default 2; see GOLD_FOREX_RESEARCH.md) | seconds to ~1 min |
 | `/quiet` · `/verbose` | turn the hourly "checked, nothing new" note off / on | seconds to ~1 min |
 | `/status` | live balance, open trades, P&L | ~3 min |
 | `/trades` | last 10 closed trades | ~3 min |
 | `/run` | check for new trades now | ~3 min |
 | `/testtrade` | smallest possible trade on the cheapest coin, opened and closed at once (proves orders reach MT5; costs a few cents of spread) | ~3 min |
-| `/close SOLUSD` | close one trade at market | ~3 min |
+| `/close SOLUSD` · `/close XAUUSD` | close one trade at market | ~3 min |
 | `/closeall confirm` | close every momentum trade at market | ~3 min |
 | `/login …` · `/logout` | save / delete the MT5 login | seconds to ~1 min |
 
-You also get, without asking: every buy (with the reason: breakout level, Bitcoin filter, stop distance),
+You also get, without asking: every buy and every gold **sell** (with the reason: breakout level, trend filter, stop distance),
 every stop raise and close with P&L, filter on/off changes, errors, a one-line note after each hourly check
 (`/quiet` turns it off) and a daily summary at 07:00 UTC. One test trade runs automatically after setup. GitHub's timers can run a few minutes late.
+
+## Strategies the bot runs
+- **Crypto breakouts** (buy only, while Bitcoin is above its 100-day EMA) — MOMENTUM_RESEARCH.md.
+- **Gold 1H breakouts, BUY and SELL** — buys when gold is above its 200-day EMA, sells when below; 2% risk;
+  stop trails every hour. Forex pairs were tested and did not pass — GOLD_FOREX_RESEARCH.md.

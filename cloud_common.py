@@ -60,6 +60,22 @@ def tg_send(http, token, chat, text):
         return False
 
 
+def gold_text(g, balance=None):
+    """Telegram text about the gold engine from the trading run's health['gold'] (runner + /gold)."""
+    tr = g.get("trend")
+    if not tr:
+        return "🥇 <b>Gold 1H</b>: trend not known yet."
+    up = tr > 0
+    txt = (f"🥇 <b>Gold 1H</b>: {'UP ⬆️ — buys only' if up else 'DOWN ⬇️ — sells only'}\n"
+           f"Daily close {g['close']:,.2f} vs 200-day avg {g['ema']:,.2f}\n")
+    if g.get("hi"):
+        txt += (f"Next: {'BUY if a 1H candle closes above ' + format(g['hi'], ',.2f') if up else 'SELL if a 1H candle closes below ' + format(g['lo'], ',.2f')}"
+                f" · stop ~{g['stop']:,.2f} away")
+    if g.get("min_risk") and balance:
+        txt += f"\nSmallest lot risks ${g['min_risk']:.2f} ({g['min_risk'] / balance * 100:.1f}% of balance)"
+    return txt
+
+
 HELP = (
     "🛰️ <b>Momentum bot — Telegram control</b>\n"
     "<b>Instant</b> (answered within a minute):\n"
@@ -69,6 +85,8 @@ HELP = (
     "/log — what the last run did\n"
     "/health — last run, login, errors\n"
     "/filter — Bitcoin trend filter\n"
+    "/gold — gold trend, next buy/sell level, size check\n"
+    "/goldrisk 2 — gold risk per trade in % (0.5–8, tested default 2)\n"
     "/quiet · /verbose — hourly check notes off/on\n"
     "/login ACCOUNT PASSWORD SERVER · /logout\n"
     "<b>Live from MT5</b> (starts a run, reply in ~3 min):\n"
@@ -76,5 +94,6 @@ HELP = (
     "/trades — last 10 closed trades\n"
     "/run — check for trades right now\n"
     "/testtrade — tiny trade opened and closed at once, to prove MT5 orders work\n"
-    "/close SOLUSD — close one trade · /closeall confirm — close all"
+    "/close SOLUSD or /close XAUUSD — close one trade · /closeall confirm — close all\n"
+    "<b>Strategies</b>: crypto breakouts (buy only, while BTC trends up) + gold 1H breakouts (BUY and SELL)"
 )
