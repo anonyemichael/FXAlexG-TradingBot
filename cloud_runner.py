@@ -187,6 +187,7 @@ def test_trade(mt5, br, syms, note):
     _, sym, info, tick = best
     ok, code, msg = br.buy(sym, info.volume_min, tick.ask * 0.95, "TEST", magic=MAGIC_TEST)
     note(f"Test trade BUY {sym} {info.volume_min}: {'ok' if ok else f'FAILED {code} {msg}'}")
+    log(f"Test order: {'opened' if ok else f'rejected (code {code})'}.")       # public log: no symbol/size/price
     if not ok:
         return (f"❌ <b>Test trade failed</b> on {sym}: broker said {code} {msg}.\n"
                 "Common causes: 10027 = Algo Trading off, 10018 = market closed, 10019 = not enough money.")
@@ -195,6 +196,7 @@ def test_trade(mt5, br, syms, note):
         return f"⚠️ Test BUY {sym} was accepted but no open position was found. Check MT5."
     ok2, code2, msg2 = br.close(pos)
     note(f"Test trade CLOSE {sym}: {'ok' if ok2 else f'FAILED {code2} {msg2}'}")
+    log(f"Test order: {'closed' if ok2 else f'close rejected (code {code2})'}.")
     return (f"✅ <b>MT5 test trade worked</b>\nBought {info.volume_min} lot {sym} at ~{tick.ask:.6g} "
             f"(ticket #{pos.ticket}) and {'closed it again' if ok2 else f'could NOT close it ({code2} {msg2}) — close it in MT5'}.\n"
             "Cost: about one spread. The bot can place and close real orders on your account.")
