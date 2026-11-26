@@ -35,7 +35,7 @@ from cloud_common import (CONTROL_STATE, DEFAULT_SERVER, RUNNER_GOLD_STATE, RUNN
 MAGIC = 26112501
 MAGIC_TEST = MAGIC + 1        # /testtrade positions (opened and closed in the same run)
 MAGIC_METAL = MAGIC + 2       # gold 1H breakout trades (buys and sells)
-COMMENT = {"mom_4h": "MOM 4H", "mom_d1": "MOM D1"}
+COMMENT = {"mom_1h": "MOM 1H", "mom_4h": "MOM 4H", "mom_d1": "MOM D1"}
 
 
 MONEY_SCALE = 1.0             # 0.01 on cent accounts (balance and profits in US cents)
@@ -58,6 +58,8 @@ class Broker:
         self.mt5 = mt5
         self.offset = 0          # trade-server time minus UTC, in hours
         self.names = {}
+        self.data = {}           # (symbol, tf hours) -> (candles received, wanted, newest candle time)
+        self._bars = {}
 
     def connect(self, path, login, password, server, portable=False):
         kw = {"login": int(login), "password": password, "server": server, "timeout": 180000}
@@ -109,14 +111,50 @@ class Broker:
         self.names[name] = None
         return None
 
+    retry_wait = 2.0          # seconds between attempts while a fresh terminal downloads history
+    TF_HOURS = {"mom_1h": 1, "met_1h": 1, "mom_4h": 4}
+
     def bars(self, symbol, engine, n=300):
-        tf = {"mom_4h": self.mt5.TIMEFRAME_H4, "met_1h": self.mt5.TIMEFRAME_H1}.get(engine, self.mt5.TIMEFRAME_D1)
-        rates = self.mt5.copy_rates_from_pos(symbol, tf, 0, n)
-        if rates is None or len(rates) == 0:
-            return None
-        df = pd.DataFrame(rates)
-        df.index = pd.to_datetime(df["time"] - self.offset * 3600, unit="s", utc=True)
-        return df[["open", "high", "low", "close"]].astype(float)
+        """Candles for one symbol/timeframe. A freshly installed terminal downloads history on demand, so a
+        short answer is retried a few times. What came back is recorded in self.data for the data check."""
+        tf = {"mom_4h": self.mt5.TIMEFRAME_H4, "met_1h": self.mt5.TIMEFRAME_H1,
+              "mom_1h": self.mt5.TIMEFRAME_H1}.get(engine, self.mt5.TIMEFRAME_D1)
+        key = (symbol, self.TF_HOURS.get(engine, 24), n)
+        if key in self._bars:
+            return self._bars[key]
+        rates = None
+        for attempt in range(3):
+            rates = self.mt5.copy_rates_from_pos(symbol, tf, 0, n)
+            if rates is not None and len(rates) >= n * 0.95:
+                break
+            if attempt < 2 and self.retry_wait:
+                import time
+                time.sleep(self.retry_wait)
+        df = None
+        if rates is not None and len(rates):
+            df = pd.DataFrame(rates)
+            df.index = pd.to_datetime(df["time"] - self.offset * 3600, unit="s", utc=True)
+            df = df[["open", "high", "low", "close"]].astype(float)
+        self.data[(symbol, key[1])] = (0 if df is None else len(df), n, None if df is None else df.index[-1])
+        self._bars[key] = df
+        return df
+
+    def data_check(self, now):
+        """(ok, total, problems): every candle set long enough and its newest candle no older than the
+        market's own last price allows (a closed market, e.g. gold at the weekend, is not a problem)."""
+        problems = []
+        for (sym, tfh), (got, want, last) in sorted(self.data.items()):
+            name = f"{sym} {'D1' if tfh == 24 else f'H{tfh}'}"
+            if got == 0:
+                problems.append(f"{name}: no candles")
+                continue
+            if got < want * 0.95:
+                problems.append(f"{name}: only {got} of {want} candles")
+            tick = self.mt5.symbol_info_tick(sym)
+            ref = self.utc(tick.time) if tick is not None and tick.time else now
+            if ref - last > pd.Timedelta(hours=2 * tfh + 1):
+                problems.append(f"{name}: newest candle {last:%d %b %H:%M} is behind the live price")
+        return len(self.data) - len({p.split(':')[0] for p in problems}), len(self.data), problems
 
     def utc(self, server_ts):
         return pd.Timestamp(server_ts - self.offset * 3600, unit="s", tz="UTC")
@@ -203,7 +241,7 @@ def size_trade(info, sl_dist, balance, risk_pct, cap_pct):
 
 def engine_of(pos):
     c = (pos.comment or "").upper()
-    return "mom_d1" if "D1" in c else "mom_4h"
+    return "mom_d1" if "D1" in c else "mom_1h" if "1H" in c else "mom_4h"
 
 
 def filter_text(btc_d, now):
@@ -554,10 +592,14 @@ def run(mt5, env, state, control=None, http=requests, now=None):
                     note(f"{sym} {label}: breakout skipped, spread too wide")
                     events.append(f"🛰️ {sym} breakout skipped: spread too wide for the stop")
                     continue
-                lot, risk_usd, why = size_trade(info, setup["sl_dist"], balance, risk, cap)
+                eng_risk = min(risk, getattr(config, "MOMENTUM_1H_RISK_PCT", 2.0)) if eng == "mom_1h" else risk
+                lot, risk_usd, why = size_trade(info, setup["sl_dist"], balance, eng_risk, cap)
                 if lot is None:
                     note(f"{sym} {label}: breakout skipped, {why}")
-                    events.append(f"🛰️ {sym} breakout skipped: {why}")
+                    skey = f"{sym}|{eng}|{setup['signal_time']}"
+                    if skey not in state.get("skipped", []):
+                        state["skipped"] = (state.get("skipped", []) + [skey])[-40:]
+                        events.append(f"🛰️ {sym} {label} breakout skipped: {why}")
                     continue
                 sl = tick.ask - setup["sl_dist"]
                 if not live:
@@ -653,6 +695,15 @@ def run(mt5, env, state, control=None, http=requests, now=None):
         else:
             events.append(f"❌ {sym} {side} order rejected ({code} {msg})")
     state["gold_note"] = gold_note
+    ok_sets, n_sets, problems = br.data_check(now)
+    health["data"] = {"ok": ok_sets, "total": n_sets, "problems": problems[:12], "at": now.timestamp()}
+    log(f"Candle data: {ok_sets}/{n_sets} sets complete and current.")
+    for p_ in problems:
+        note(f"Data problem: {p_}")
+    if problems and live and state.get("data_alert_day") != now.strftime("%Y-%m-%d"):
+        state["data_alert_day"] = now.strftime("%Y-%m-%d")
+        events.append("⚠️ <b>Candle data incomplete</b> — the bot skipped what it couldn't read:\n• "
+                      + "\n• ".join(problems[:6]))
     log(f"Checked {sum(1 for s in syms.values() if s) + sum(1 for s in gsyms.values() if s)} symbols; "
         f"{entries} new entr{'y' if entries == 1 else 'ies'}.")
     health["open"] = len(br.all_positions())
@@ -669,7 +720,7 @@ def run(mt5, env, state, control=None, http=requests, now=None):
         ps = br.all_positions()
         lines.append(f"\n<b>Open trades: {len(ps)}</b>")
         for p in ps:
-            kind = MS.LABEL if p.magic == MAGIC_METAL else ("Daily" if engine_of(p) == "mom_d1" else "4H")
+            kind = MS.LABEL if p.magic == MAGIC_METAL else M.ENGINES[engine_of(p)]["label"]
             lines.append(f"• {'SELL' if side_of(p) < 0 else 'BUY'} {p.symbol} ({kind}) "
                          f"{p.volume} lot, stop {p.sl:.6g}, P&L {usd(p.profit, True)}")
         closed = [d for d in br.deals(now - pd.Timedelta(days=7)) if d.entry == mt5.DEAL_ENTRY_OUT]

@@ -16,6 +16,7 @@ os.environ.setdefault("TELEGRAM_TOKEN", "")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import cloud_runner as C  # noqa: E402
+C.Broker.retry_wait = 0       # fake MT5 answers at once; no waiting for history downloads
 
 NOW = pd.Timestamp("2026-06-10 09:07", tz="UTC")
 
@@ -39,7 +40,7 @@ class FakeMT5:
     TRADE_RETCODE_DONE, TRADE_RETCODE_PLACED = 10009, 10008
     DEAL_ENTRY_IN, DEAL_ENTRY_OUT = 0, 1
 
-    def __init__(self, btc_up=True, breakout=True, gold=None, balance=10.0):
+    def __init__(self, btc_up=True, breakout=True, gold=None, balance=10.0, sol_h1=False):
         """gold: None (no gold symbol), 'up' (uptrend + 1H breakout), 'down' (downtrend + 1H breakdown),
         'against' (uptrend but a 1H breakdown), 'quiet' (uptrend, no breakout)."""
         self.balance = balance
@@ -57,6 +58,13 @@ class FakeMT5:
         self.logged_in = False
         self.h1 = {}
         self.gold = gold
+        if sol_h1:                                                 # SOL 1H breakout on the last closed candle
+            last1 = NOW.floor("1h") - pd.Timedelta(hours=1)
+            s1 = _bars(400, last1 + pd.Timedelta(hours=1), "1h", 0.0, 6, 150.0, sd=0.003)
+            i = s1.index.get_loc(last1)
+            s1.iloc[i, s1.columns.get_loc("close")] = s1["high"].iloc[i - 168:i].max() * 1.01
+            s1.iloc[i, s1.columns.get_loc("high")] = s1["close"].iloc[i] * 1.001
+            self.h1["SOLUSDm"] = s1
         if gold:
             last1 = NOW.floor("1h") - pd.Timedelta(hours=1)          # last closed 1H candle
             g = _bars(400, last1 + pd.Timedelta(hours=1), "1h", 0.0, 4, 3500.0, sd=0.002)
@@ -444,6 +452,40 @@ def test_missing_btc_no_longer_stops_gold():
     mt5 = NoCrypto(gold="up", balance=5000.0)
     code, state, http, out = _run(mt5)
     assert code == 0 and [o["symbol"] for o in mt5.orders] == ["XAUUSDm"] and "crypto skipped" in out
+
+
+def test_1h_engine_buys_with_2pct_cap():
+    mt5 = FakeMT5(breakout=False, sol_h1=True, balance=1000.0)
+    C.config.MOMENTUM_SYMBOLS = ["SOLUSDm"]
+    C.config.MOMENTUM_TELEGRAM_CHAT_ID = None
+    C.config.MOMENTUM_ENGINES = ["mom_1h"]
+    state, http = {}, FakeHTTP()
+    with contextlib.redirect_stdout(io.StringIO()):
+        C.run(mt5, ENV, state, {}, http=http, now=NOW)               # /risk is 5% (ENV), the 1H engine caps at 2%
+    o = [x for x in mt5.orders if x["symbol"] == "SOLUSDm"]
+    assert len(o) == 1 and o[0]["comment"] == "MOM 1H"
+    buy = next(t for t in http.sent if "BUY SOLUSDm" in t)
+    import re
+    pct = float(re.search(r"Risk \$[\d.]+ \(([\d.]+)% of", buy).group(1))
+    assert "(1H breakout)" in buy and 1.0 < pct <= 2.0
+    assert C.engine_of(mt5.positions[0]) == "mom_1h"
+
+
+def test_candle_data_check():
+    mt5 = FakeMT5(breakout=False, gold="quiet", balance=5000.0)
+    _, state, http, out = _run(mt5)
+    d = state["health"]["data"]
+    assert d["ok"] == d["total"] and not d["problems"] and f"Candle data: {d['total']}/{d['total']}" in out
+    # short history and a stale feed are reported (once a day), without symbol names in the public log
+    mt5 = FakeMT5(breakout=False, gold="quiet", balance=5000.0)
+    mt5.h1["XAUUSDm"] = mt5.h1["XAUUSDm"].iloc[:200]
+    _, state, http, out = _run(mt5)
+    probs = state["health"]["data"]["problems"]
+    assert any("XAUUSDm H1: only 200 of 400" in p for p in probs) and any("behind the live price" in p for p in probs)
+    assert "complete and current" in out and "XAU" not in out
+    assert any("Candle data incomplete" in t for t in http.sent)
+    _, _, http, _ = _run(mt5, state=state)
+    assert not any("Candle data incomplete" in t for t in http.sent)
 
 
 def test_hourly_note_and_quiet():

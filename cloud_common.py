@@ -97,5 +97,6 @@ HELP = (
     "/run — check for trades right now\n"
     "/testtrade — tiny trade opened and closed at once, to prove MT5 orders work\n"
     "/close SOLUSD or /close XAUUSD — close one trade · /closeall confirm — close all\n"
-    "<b>Strategies</b>: crypto breakouts (buy only, while BTC trends up) + gold 1H breakouts (BUY and SELL)"
+    "<b>Strategies</b> (day entries on 1H candles, winners held as swings): crypto 1H/4H/daily breakouts "
+    "(buy only, while BTC trends up) + gold 1H breakouts (BUY and SELL)"
 )

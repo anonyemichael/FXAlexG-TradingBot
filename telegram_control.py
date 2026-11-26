@@ -39,7 +39,8 @@ def settings_text(ctl):
             f"Max open trades: {getattr(config, 'MOMENTUM_MAX_OPEN', 4)}\n"
             f"Hourly check notes: {'on' if ctl.get('verbose', True) else 'off'}\n"
             f"Coins: {coins}\n"
-            f"Engines: 4H + Daily breakouts, BTC EMA{getattr(config, 'MOMENTUM_REGIME_EMA', 100)} filter\n"
+            f"Crypto engines: 1H (max {getattr(config, 'MOMENTUM_1H_RISK_PCT', 2.0):g}% risk) + 4H + Daily breakouts, "
+            f"BTC EMA{getattr(config, 'MOMENTUM_REGIME_EMA', 100)} filter\n"
             f"Gold 1H (buy + sell): risk <b>{ctl.get('gold_risk') or getattr(config, 'METALS_RISK_PCT', 2.0):g}%</b> "
             f"(never above {getattr(config, 'METALS_MAX_RISK_PCT', 5.0):g}%) on "
             f"{('gold account ' + str(ctl['gold_creds']['login'])) if ctl.get('gold_creds') else 'the main account'}\n"
@@ -68,7 +69,9 @@ def health_text(run, ctl, now):
             f"Algo Trading: {h.get('algo', 'unknown')}\n"
             f"Orders: {h.get('trading', 'unknown')}\n"
             f"Open trades: {h.get('open', '?')} · Balance: {h.get('balance', '?')}\n"
-            f"Last error: {h.get('error') or 'none'}\n"
+            + (f"Candle data: {h['data']['ok']}/{h['data']['total']} sets complete and current\n" if h.get("data") else "")
+            + "".join(f"  ⚠️ {p}\n" for p in (h.get("data") or {}).get("problems", [])[:5])
+            + f"Last error: {h.get('error') or 'none'}\n"
             f"New trades: {'paused' if ctl.get('paused') else 'on'}" + warn)
 
 

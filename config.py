@@ -93,7 +93,10 @@ MOMENTUM_4H_BREAK      = 42
 MOMENTUM_4H_ATR        = 2.5
 MOMENTUM_D1_BREAK      = 20
 MOMENTUM_D1_ATR        = 3.0
-MOMENTUM_ENGINES       = ["mom_4h", "mom_d1"]
+MOMENTUM_1H_BREAK      = 168    # 1H engine: close above the last 168 1H candles' high (one week), DAY_SWING_RESEARCH.md
+MOMENTUM_1H_ATR        = 3.0
+MOMENTUM_1H_RISK_PCT   = 2.0    # the 1H engine trades more often: never more than this per trade
+MOMENTUM_ENGINES       = ["mom_4h", "mom_d1", "mom_1h"]   # order = priority for the 4 open-trade slots
 MOMENTUM_MAX_OPEN      = 4
 MOMENTUM_RISK_PCT      = 5.0    # used when no accounts.db rows exist (per-account risk otherwise: /risk)
 MOMENTUM_MAX_RISK_PCT  = 8.0    # skip a trade if even the minimum lot would risk more than this

@@ -41,6 +41,9 @@ every stop raise and close with P&L, filter on/off changes, errors, a one-line n
 (`/quiet` turns it off) and a daily summary at 07:00 UTC. One test trade runs automatically after setup. GitHub's timers can run a few minutes late.
 
 ## Strategies the bot runs
-- **Crypto breakouts** (buy only, while Bitcoin is above its 100-day EMA) — MOMENTUM_RESEARCH.md.
+- **Crypto breakouts** on 1H, 4H and daily candles (buy only, while Bitcoin is above its 100-day EMA; the
+  1H engine risks at most 2%) — MOMENTUM_RESEARCH.md, DAY_SWING_RESEARCH.md.
 - **Gold 1H breakouts, BUY and SELL** — buys when gold is above its 200-day EMA, sells when below; 2% risk;
   stop trails every hour. Forex pairs were tested and did not pass — GOLD_FOREX_RESEARCH.md.
+- Entries are decided on live candles every hour ("day" entries); losers are cut fast, winners are held as
+  swings. Pure same-day trading was tested and lost after costs — DAY_SWING_RESEARCH.md.

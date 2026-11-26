@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-FAM = sys.argv[1] if len(sys.argv) > 1 else "gold"
+FAM = (sys.argv[1] if len(sys.argv) > 1 else "gold") if __name__ == "__main__" else "none"
 FAM = "all" if FAM == "families" else FAM   # or one of: donchian ema rsi bb london
 
 D = os.environ.get("FX_DATA", "data")
@@ -139,7 +139,8 @@ def d1_on(df_tf, d1_series):
 
 # ── simulator ─────────────────────────────────────────────────────────────────
 def simulate(df, sym, long_sig, short_sig, stop_dist, trail=None, exit_long=None, exit_short=None,
-             tp_r=None, max_bars=None, trail_src="close", start=None, end=None, eod_hours=None):
+             tp_r=None, max_bars=None, trail_src="close", start=None, end=None, eod_hours=None, cost_frac=0.0,
+             one_per_day=False):
     """Signals are evaluated on bar close (arrays aligned with df); entries at next bar open.
     stop_dist: price distance of the initial stop (array). trail: array of trailing distance (chandelier
     from the best close/high since entry) or None. exit_*: bool arrays -> exit at next open.
@@ -154,6 +155,8 @@ def simulate(df, sym, long_sig, short_sig, stop_dist, trail=None, exit_long=None
     trades = []
     pos = 0
     i = 0
+    last_day = None
+    days = idx.normalize() if one_per_day else None
     lo_t = np.searchsorted(idx.values, np.datetime64(start)) if start is not None else 0
     hi_t = np.searchsorted(idx.values, np.datetime64(end)) if end is not None else n
     while i < n - 1:
@@ -162,9 +165,11 @@ def simulate(df, sym, long_sig, short_sig, stop_dist, trail=None, exit_long=None
                 i += 1
                 continue
             d = 1 if long_sig[i] else -1 if short_sig[i] else 0
-            if d == 0 or not np.isfinite(stop_dist[i]) or stop_dist[i] <= 0:
+            if d == 0 or not np.isfinite(stop_dist[i]) or stop_dist[i] <= 0 or (one_per_day and days[i] == last_day):
                 i += 1
                 continue
+            if one_per_day:
+                last_day = days[i]
             j = i + 1
             entry = o[j]
             risk = stop_dist[i]
@@ -197,7 +202,7 @@ def simulate(df, sym, long_sig, short_sig, stop_dist, trail=None, exit_long=None
                     stop = max(stop, ns) if d == 1 else min(stop, ns)
                 k += 1
             held_days = max((idx[min(k, n - 1)] - t0).total_seconds() / 86400.0, 0)
-            cost = sp + entry * swap_bar * held_days
+            cost = sp + entry * swap_bar * held_days + entry * cost_frac
             r = (d * (exit_px - entry) - cost) / risk
             trades.append({"sym": sym, "t": t0, "d": d, "R": r, "days": held_days,
                            "risk_frac": risk / entry})

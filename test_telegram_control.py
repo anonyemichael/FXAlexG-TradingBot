@@ -188,6 +188,14 @@ def test_goldlogin_and_gold_from_gold_account():
     assert "gold_creds" not in ctl
 
 
+def test_health_shows_candle_data():
+    run = {"last_run": NOW - 60, "result": "ok", "health": {"login": "ok", "data": {
+        "ok": 17, "total": 18, "problems": ["XAUUSDm H1: only 200 of 400 candles"]}}}
+    _, _, http = _go([msg(1, 777, "/health")], {"tg_chat": "777"}, run)
+    h = texts(http)[0]
+    assert "Candle data: 17/18 sets complete and current" in h and "only 200 of 400" in h
+
+
 def test_main_saves_before_dispatch():
     import tempfile
     from cloud_common import load_json

@@ -56,6 +56,29 @@ def test_entry_needs_regime():
     assert M.entry_signal("SOLUSDm", df, "mom_4h", False, now=now) is None
 
 
+def test_1h_engine_and_late_entry():
+    df = _bars(400, freq="1h", seed=7)
+    j = len(df) - 2                                             # last closed 1H candle (the last row is forming)
+    lvl = df["high"].iloc[j - 168:j].max()
+    df.iloc[j, df.columns.get_loc("close")] = lvl * 1.01
+    df.iloc[j, df.columns.get_loc("high")] = lvl * 1.011
+    now = df.index[-1] + pd.Timedelta(minutes=10)
+    s = M.entry_signal("SOLUSDm", df, "mom_1h", True, now=now)
+    assert s and s["trigger"] == "mom_1h" and "168-candle high" in s["met"][1] and s["sl_dist"] > 0
+    # the hourly run came one candle late: still taken while price is above the level ...
+    late = df.copy()
+    late.iloc[-1, late.columns.get_loc("close")] = lvl * 1.005
+    late.iloc[-1, late.columns.get_loc("high")] = max(late["high"].iloc[-1], lvl * 1.005)
+    nxt = late.index[-1] + pd.Timedelta(hours=1)
+    late.loc[nxt] = late.iloc[-1]
+    s2 = M.entry_signal("SOLUSDm", late, "mom_1h", True, now=nxt + pd.Timedelta(minutes=5))
+    assert s2 and s2["signal_time"] == str(df.index[j])
+    # ... but not once price has fallen back below it, and the 4H engine never takes late entries
+    late.iloc[-2, late.columns.get_loc("close")] = lvl * 0.99
+    assert M.entry_signal("SOLUSDm", late, "mom_1h", True, now=nxt + pd.Timedelta(minutes=5)) is None
+    assert M.ENGINES["mom_4h"].get("late") is None
+
+
 def test_live_matches_backtest_flags():
     df = _bars(1200, drift=0.0005, seed=5)
     flags, _, _ = M.entry_flags(df, "mom_4h")

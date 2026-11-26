@@ -12,6 +12,10 @@ off when Bitcoin is in a downtrend, were the only thing that held up on coins an
   Daily engine   the daily candle closes above the previous 20 days' high -> buy. Stop 3 x ATR(20) daily,
                  trailed every day. Stops are ~14% of price, so on small accounts the risk manager skips
                  these until the balance can carry the minimum lot.
+  1H engine      the 1H candle closes above the highest high of the previous 168 1H candles (one week) -> buy.
+                 Stop 3 x ATR(20) on 1H (~3% of price), trailed every hour. Same BTC filter. Entries are
+                 intraday; ~60% of trades end the same day as small losses, the winners run for days
+                 (DAY_SWING_RESEARCH.md: PF 1.30 in 2022-23 and 1.40 in 2024-26 on 10 coins). Risk capped at 2%.
   Long only, no fixed take-profit, one trade per coin.
 
 Every function here is used by both the bot and momentum_research.py, so the backtest is the live code.
@@ -26,6 +30,9 @@ REGIME_EMA = getattr(config, "MOMENTUM_REGIME_EMA", 100)
 ENGINES = {
     "mom_4h": {"tf_hours": 4, "break": getattr(config, "MOMENTUM_4H_BREAK", 42),
                "atr_mult": getattr(config, "MOMENTUM_4H_ATR", 2.5), "regime_exit": False, "label": "4H"},
+    "mom_1h": {"tf_hours": 1, "break": getattr(config, "MOMENTUM_1H_BREAK", 168),
+               "atr_mult": getattr(config, "MOMENTUM_1H_ATR", 3.0), "regime_exit": False, "label": "1H",
+               "late": True},
     "mom_d1": {"tf_hours": 24, "break": getattr(config, "MOMENTUM_D1_BREAK", 20),
                "atr_mult": getattr(config, "MOMENTUM_D1_ATR", 3.0), "regime_exit": True, "label": "Daily"},
 }
@@ -92,8 +99,14 @@ def entry_signal(symbol, df, engine, regime_is_on, now=None):
     if len(closed) < e["break"] + ATR_LEN + 2:
         return None
     flags, brk, a = entry_flags(closed, engine)
+    j = -1
     if not flags[-1]:
-        return None
+        # hourly engine: the run may come one candle late — still take it while price is above that level
+        c = closed["close"].to_numpy()
+        if e.get("late") and len(flags) > 1 and flags[-2] and c[-1] > brk[-2]:
+            j = -2
+        else:
+            return None
     entry = float(closed["close"].iloc[-1])
     sl_dist = e["atr_mult"] * float(a[-1])
     return {
@@ -102,11 +115,11 @@ def entry_signal(symbol, df, engine, regime_is_on, now=None):
         "tp": 0.0, "tp1": None, "tp2": 0.0, "rr": 0.0,
         "grade": "MOM", "score": 100,
         "met": [f"BTC above its {REGIME_EMA}-day EMA (market filter on)",
-                f"{e['label']} close above the {e['break']}-candle high ({float(brk[-1]):.6g})",
+                f"{e['label']} close above the {e['break']}-candle high ({float(brk[j]):.6g})",
                 f"Stop {e['atr_mult']}x ATR({ATR_LEN}) = {sl_dist / entry * 100:.1f}%, trailed every {e['label']} close"],
         "trigger": engine, "atr": float(a[-1]),
         "w_bias": "-", "d_trend": "-", "h4_bias": "bullish", "synced": 0, "swing_eq": 0.0, "adx": 0.0,
-        "signal_time": str(closed.index[-1]),
+        "signal_time": str(closed.index[j]),
     }
 
 
