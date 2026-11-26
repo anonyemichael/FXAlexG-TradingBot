@@ -695,6 +695,10 @@ def run(mt5, env, state, control=None, http=requests, now=None):
         else:
             events.append(f"❌ {sym} {side} order rejected ({code} {msg})")
     state["gold_note"] = gold_note
+    # read every coin's candles even while the BTC filter is off, so data problems show up before it turns on
+    for eng in (getattr(config, "MOMENTUM_ENGINES", ["mom_4h", "mom_d1"]) if crypto_on else []):
+        for sym in (v for v in syms.values() if v):
+            br.bars(sym, eng)
     ok_sets, n_sets, problems = br.data_check(now)
     health["data"] = {"ok": ok_sets, "total": n_sets, "problems": problems[:12], "at": now.timestamp()}
     log(f"Candle data: {ok_sets}/{n_sets} sets complete and current.")

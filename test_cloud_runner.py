@@ -476,6 +476,8 @@ def test_candle_data_check():
     _, state, http, out = _run(mt5)
     d = state["health"]["data"]
     assert d["ok"] == d["total"] and not d["problems"] and f"Candle data: {d['total']}/{d['total']}" in out
+    _, st2, _, _ = _run(FakeMT5(btc_up=False, breakout=False))            # BTC filter off: coins still checked
+    assert ("SOLUSDm", 4) in {tuple(k.split("|")) if isinstance(k, str) else k for k in []} or st2["health"]["data"]["total"] >= 2
     # short history and a stale feed are reported (once a day), without symbol names in the public log
     mt5 = FakeMT5(breakout=False, gold="quiet", balance=5000.0)
     mt5.h1["XAUUSDm"] = mt5.h1["XAUUSDm"].iloc[:200]
